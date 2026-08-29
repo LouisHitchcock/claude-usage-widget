@@ -148,28 +148,50 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
               "CLAUDE · USAGE", hex_to_qcolor(t["accent"]), title_f,
               letter_spacing_px=3.0 * s)
 
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
     # An optional model-scoped weekly cap (e.g. "Fable") is drawn as a third
     # 270° gauge centred below the SESSION/WEEKLY pair. Present only when the
     # API reports it; otherwise the OSD renders byte-for-byte as before.
-    scoped_present = data.scoped_pct is not None
+    scoped_present = (not multi) and data.scoped_pct is not None
     # Optional second provider (Codex): two extra gauges below the pair, drawn
     # in the identical HUD style. When absent the OSD renders byte-for-byte as
     # before. The overlay grows the panel by METRICS['codex_rows_height'].
     codex_present = getattr(data, "codex_available", False)
+    multi_extra = max(0, len(accounts) - 1) if multi else 0
+    multi_scoped = 0
+    if multi:
+        multi_scoped = sum(
+            1 for a in accounts
+            if getattr(a, "scoped_pct", None) is not None and getattr(a, "scoped_label", "")
+        )
 
-    # gauges — equally spaced. When a scoped/codex gauge is present the pair
-    # stays anchored to the original-height centre (top of the taller window)
-    # so the extra gauges sit beneath it and the ticker slides to the bottom.
-    if scoped_present or codex_present:
+    # gauges — equally spaced. When a scoped/codex/multi gauge is present the
+    # pair stays anchored to the original-height centre (top of the taller
+    # window) so the extra gauges sit beneath it and the ticker slides down.
+    if scoped_present or codex_present or multi:
         y_mid = rect.y() + m["osd_height"] * s / 2 + 10 * s
     else:
         y_mid = rect.y() + rect.height() / 2 + 10 * s
     third = rect.width() / 3
-    paint_gauge(p, rect.x() + third * 0.5, y_mid, data.session_pct,
-                "SESSION", f"{data.session_reset_min}m", s)
-    paint_gauge(p, rect.x() + third * 2.5, y_mid, data.weekly_pct,
-                "WEEKLY",
-                f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m", s)
+    if multi:
+        first = accounts[0]
+        name0 = (getattr(first, "name", "") or "acct").upper()
+        paint_gauge(p, rect.x() + third * 0.5, y_mid,
+                    float(getattr(first, "session_pct", 0.0) or 0.0),
+                    f"{name0} 5H",
+                    f"{int(getattr(first, 'session_reset_min', 0) or 0)}m", s)
+        paint_gauge(p, rect.x() + third * 2.5, y_mid,
+                    float(getattr(first, "weekly_pct", 0.0) or 0.0),
+                    f"{name0} 7D",
+                    f"{int(getattr(first, 'weekly_reset_hrs', 0) or 0)}h "
+                    f"{int(getattr(first, 'weekly_reset_min', 0) or 0)}m", s)
+    else:
+        paint_gauge(p, rect.x() + third * 0.5, y_mid, data.session_pct,
+                    "SESSION", f"{data.session_reset_min}m", s)
+        paint_gauge(p, rect.x() + third * 2.5, y_mid, data.weekly_pct,
+                    "WEEKLY",
+                    f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m", s)
 
     # center column — live + today
     cx = rect.x() + rect.width() / 2
@@ -190,17 +212,52 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
     # the exact same renderer/fonts/spacing as WEEKLY. Gated purely on
     # scoped_pct so a set-but-empty label still renders (fallback "SCOPED").
     single_row = (m["osd_height_scoped"] - m["osd_height"]) * s
-    if scoped_present:
+    slot = 0
+    if multi:
+        # First account scoped (if any), then each extra account's 5h/7d pair
+        # as two centred gauges, then their scoped rows.
+        first = accounts[0]
+        if getattr(first, "scoped_pct", None) is not None and getattr(first, "scoped_label", ""):
+            slot += 1
+            paint_gauge(
+                p, cx, y_mid + slot * single_row, float(first.scoped_pct),
+                f"{(getattr(first, 'name', '') or 'acct').upper()} {first.scoped_label.upper()}",
+                f"{int(first.scoped_reset_hrs)}h {int(first.scoped_reset_min)}m", s,
+            )
+        for acct in accounts[1:]:
+            name = (getattr(acct, "name", "") or "acct").upper()
+            slot += 1
+            paint_gauge(
+                p, cx, y_mid + slot * single_row,
+                float(getattr(acct, "session_pct", 0.0) or 0.0),
+                f"{name} 5H",
+                f"{int(getattr(acct, 'session_reset_min', 0) or 0)}m", s,
+            )
+            slot += 1
+            paint_gauge(
+                p, cx, y_mid + slot * single_row,
+                float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                f"{name} 7D",
+                f"{int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}h "
+                f"{int(getattr(acct, 'weekly_reset_min', 0) or 0)}m", s,
+            )
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                slot += 1
+                paint_gauge(
+                    p, cx, y_mid + slot * single_row, float(acct.scoped_pct),
+                    f"{name} {acct.scoped_label.upper()}",
+                    f"{int(acct.scoped_reset_hrs)}h {int(acct.scoped_reset_min)}m", s,
+                )
+    elif scoped_present:
         scoped_label = (data.scoped_label or "SCOPED").upper()
-        y_scoped = y_mid + single_row
-        paint_gauge(p, cx, y_scoped, data.scoped_pct, scoped_label,
+        slot = 1
+        paint_gauge(p, cx, y_mid + single_row, data.scoped_pct, scoped_label,
                     f"{data.scoped_reset_hrs}h {data.scoped_reset_min}m", s)
 
     # Codex (optional second provider) — two more centred gauges below the
-    # pair (and below the scoped gauge if present), same renderer/fonts/spacing
-    # as SESSION/WEEKLY. The scoped gauge, when shown, occupies the first slot.
+    # pair (and below the scoped/multi gauges if present), same renderer.
     if codex_present:
-        base = 1 if scoped_present else 0
+        base = slot
         y_codex_5h = y_mid + (base + 1) * single_row
         paint_gauge(p, cx, y_codex_5h, data.codex_session_pct, "CODEX 5H",
                     f"{data.codex_session_reset_min}m", s)

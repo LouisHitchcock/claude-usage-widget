@@ -123,46 +123,12 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
     y_rule = y + fm_t.height() + fm.height() + 2 * s
     _draw_dashed_rule(p, x, y_rule, x + w, hex_to_qcolor(t["rule"]))
 
-    # SESSION row + bar
-    yy = y_rule + 6 * s
-    draw_text(p, x, yy + fm.ascent(), "SESSION",
-              hex_to_qcolor(t["ink"]), body_f)
-    right = f"{int(data.session_pct * 100)}% · {data.session_reset_min}m"
-    rw = fm.horizontalAdvance(right)
-    draw_text(p, x + w - rw, yy + fm.ascent(), right,
-              hex_to_qcolor(t["ink"]), body_f)
-    yy += fm.height() + 2 * s
-    # bar is a rect with 1px ink border
-    p.setPen(hex_to_qcolor(t["rule"])); p.setBrush(hex_to_qcolor(t["bar_track"]))
-    p.drawRect(QRectF(x, yy, w, 8 * s))
-    p.setPen(Qt.NoPen); p.setBrush(hex_to_qcolor(t["ink"]))
-    p.drawRect(QRectF(x, yy, w * data.session_pct, 8 * s))
-
-    # WEEKLY
-    yy += 8 * s + 6 * s
-    draw_text(p, x, yy + fm.ascent(), "WEEKLY",
-              hex_to_qcolor(t["ink"]), body_f)
-    right = f"{int(data.weekly_pct * 100)}% · {data.weekly_reset_hrs}h{data.weekly_reset_min}m"
-    rw = fm.horizontalAdvance(right)
-    draw_text(p, x + w - rw, yy + fm.ascent(), right,
-              hex_to_qcolor(t["ink"]), body_f)
-    yy += fm.height() + 2 * s
-    p.setPen(hex_to_qcolor(t["rule"])); p.setBrush(hex_to_qcolor(t["bar_track"]))
-    p.drawRect(QRectF(x, yy, w, 8 * s))
-    p.setPen(Qt.NoPen); p.setBrush(hex_to_qcolor(t["ink"]))
-    p.drawRect(QRectF(x, yy, w * data.weekly_pct, 8 * s))
-
-    # SCOPED — optional third row (e.g. Anthropic "Fable" weekly cap). Only
-    # drawn when the API reports it; mirrors the WEEKLY row exactly so it reads
-    # as a native third line. Leaves yy on the scoped bar's top edge so the
-    # ticker/footer below shift down by one row via the existing yy math. When
-    # absent, nothing runs and the layout is byte-for-byte the pre-scoped one.
-    if data.scoped_pct is not None:
-        yy += 8 * s + 6 * s
-        draw_text(p, x, yy + fm.ascent(),
-                  (data.scoped_label or "SCOPED").upper(),
+    def _receipt_row(label: str, pct: float, right: str, first: bool) -> None:
+        nonlocal yy
+        if not first:
+            yy += 8 * s + 6 * s
+        draw_text(p, x, yy + fm.ascent(), label,
                   hex_to_qcolor(t["ink"]), body_f)
-        right = f"{int(data.scoped_pct * 100)}% · {data.scoped_reset_hrs}h{data.scoped_reset_min}m"
         rw = fm.horizontalAdvance(right)
         draw_text(p, x + w - rw, yy + fm.ascent(), right,
                   hex_to_qcolor(t["ink"]), body_f)
@@ -170,7 +136,59 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
         p.setPen(hex_to_qcolor(t["rule"])); p.setBrush(hex_to_qcolor(t["bar_track"]))
         p.drawRect(QRectF(x, yy, w, 8 * s))
         p.setPen(Qt.NoPen); p.setBrush(hex_to_qcolor(t["ink"]))
-        p.drawRect(QRectF(x, yy, w * data.scoped_pct, 8 * s))
+        p.drawRect(QRectF(x, yy, w * pct, 8 * s))
+
+    # SESSION / WEEKLY (+ multi-Claude labeled pairs)
+    yy = y_rule + 6 * s
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
+    first_row = True
+    if multi:
+        for acct in accounts:
+            name = (getattr(acct, "name", "") or "acct").upper()
+            _receipt_row(
+                f"{name} 5H",
+                float(getattr(acct, "session_pct", 0.0) or 0.0),
+                f"{int(float(getattr(acct, 'session_pct', 0.0) or 0.0) * 100)}% · "
+                f"{int(getattr(acct, 'session_reset_min', 0) or 0)}m",
+                first_row,
+            )
+            first_row = False
+            _receipt_row(
+                f"{name} 7D",
+                float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                f"{int(float(getattr(acct, 'weekly_pct', 0.0) or 0.0) * 100)}% · "
+                f"{int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}h"
+                f"{int(getattr(acct, 'weekly_reset_min', 0) or 0)}m",
+                False,
+            )
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                _receipt_row(
+                    f"{name} {acct.scoped_label.upper()}",
+                    float(acct.scoped_pct),
+                    f"{int(float(acct.scoped_pct) * 100)}% · "
+                    f"{int(acct.scoped_reset_hrs)}h{int(acct.scoped_reset_min)}m",
+                    False,
+                )
+    else:
+        _receipt_row(
+            "SESSION", data.session_pct,
+            f"{int(data.session_pct * 100)}% · {data.session_reset_min}m",
+            True,
+        )
+        _receipt_row(
+            "WEEKLY", data.weekly_pct,
+            f"{int(data.weekly_pct * 100)}% · {data.weekly_reset_hrs}h{data.weekly_reset_min}m",
+            False,
+        )
+        # SCOPED — optional third row (e.g. Anthropic "Fable" weekly cap).
+        if data.scoped_pct is not None:
+            _receipt_row(
+                (data.scoped_label or "SCOPED").upper(),
+                data.scoped_pct,
+                f"{int(data.scoped_pct * 100)}% · {data.scoped_reset_hrs}h{data.scoped_reset_min}m",
+                False,
+            )
 
     # CODEX — optional second-provider pair (Codex 5h + 7d). Mirrors the
     # SESSION/WEEKLY rows exactly so they read as two more native receipt lines.

@@ -123,19 +123,44 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
                   letter_spacing_px=1.0 * s)
 
     # rows: SESSION + WEEKLY (+ optional scoped weekly cap, e.g. "FABLE")
-    rows = [
-        ("SESSION", data.session_pct, f"{data.session_reset_min}m", t["accent"]),
-        ("WEEKLY",  data.weekly_pct,  f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m", t["accent2"]),
-    ]
-    # Third row appears only when the API reports a model-scoped weekly cap.
-    # Drawn in the Weekly row's own idiom — same bar, fonts, accent2 colour —
-    # so it reads as a native row. The bottom-anchored ticker (below) rides
-    # down automatically because the overlay grows the OSD to osd_height_scoped.
-    if data.scoped_pct is not None:
-        rows.append((
-            (data.scoped_label or "SCOPED").upper(), data.scoped_pct,
-            f"{data.scoped_reset_hrs}h {data.scoped_reset_min}m", t["accent2"],
-        ))
+    # Multi-Claude mode replaces the single pair with labeled per-account pairs.
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
+    rows: list = []
+    if multi:
+        for acct in accounts:
+            name = (getattr(acct, "name", "") or "acct").upper()
+            rows.append((
+                f"{name} 5H", float(getattr(acct, "session_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'session_reset_min', 0) or 0)}m", t["accent"],
+            ))
+            rows.append((
+                f"{name} 7D", float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}h "
+                f"{int(getattr(acct, 'weekly_reset_min', 0) or 0)}m",
+                t["accent2"],
+            ))
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                rows.append((
+                    f"{name} {(acct.scoped_label or 'SCOPED').upper()}",
+                    float(acct.scoped_pct),
+                    f"{int(acct.scoped_reset_hrs)}h {int(acct.scoped_reset_min)}m",
+                    t["accent2"],
+                ))
+    else:
+        rows = [
+            ("SESSION", data.session_pct, f"{data.session_reset_min}m", t["accent"]),
+            ("WEEKLY",  data.weekly_pct,  f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m", t["accent2"]),
+        ]
+        # Third row appears only when the API reports a model-scoped weekly cap.
+        # Drawn in the Weekly row's own idiom — same bar, fonts, accent2 colour —
+        # so it reads as a native row. The bottom-anchored ticker (below) rides
+        # down automatically because the overlay grows the OSD to osd_height_scoped.
+        if data.scoped_pct is not None:
+            rows.append((
+                (data.scoped_label or "SCOPED").upper(), data.scoped_pct,
+                f"{data.scoped_reset_hrs}h {data.scoped_reset_min}m", t["accent2"],
+            ))
     # Optional Codex second-provider pair — mirrors the Session/Weekly idiom
     # (accent for the 5h window, accent2 for the 7d window). Drawn via the same
     # rows loop, so the bottom-anchored ticker rides down on the overlay's

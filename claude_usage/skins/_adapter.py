@@ -26,6 +26,23 @@ class SkinTickerItem:
 
 
 @dataclass
+class SkinAccount:
+    """One Claude subscription row for multi-account OSD skins."""
+
+    name: str = ""
+    session_pct: float = 0.0
+    session_reset_min: int = 0
+    weekly_pct: float = 0.0
+    weekly_reset_hrs: int = 0
+    weekly_reset_min: int = 0
+    scoped_pct: float | None = None
+    scoped_reset_hrs: int = 0
+    scoped_reset_min: int = 0
+    scoped_label: str = ""
+    error: str = ""
+
+
+@dataclass
 class SkinData:
     """The field layout every ``paint_osd`` in :mod:`claude_usage.skins` expects."""
 
@@ -50,6 +67,8 @@ class SkinData:
     codex_weekly_pct: float = 0.0
     codex_weekly_reset_hrs: int = 0
     codex_weekly_reset_min: int = 0
+    # Multi-Claude accounts (2+). Empty => single Session/Weekly pair.
+    claude_accounts: list[SkinAccount] = field(default_factory=list)
     live_tok_per_min: float = 0.0  # in thousands (e.g. 10.5 means 10.5k)
     is_live: bool = False
     subagent_count: int = 0
@@ -287,6 +306,47 @@ def from_usage_stats(
             codex_weekly_reset_hrs = cw_left // 3600
             codex_weekly_reset_min = (cw_left % 3600) // 60
 
+    claude_accounts: list[SkinAccount] = []
+    for raw in list(getattr(stats, "claude_accounts", []) or []):
+        name = str(getattr(raw, "name", "") or "")
+        err = str(getattr(raw, "error", "") or "")
+        s_reset_min = 0
+        s_reset = int(getattr(raw, "session_reset", 0) or 0)
+        if s_reset > 0:
+            s_reset_min = max(0, int(s_reset - now_ts)) // 60
+        w_reset = int(getattr(raw, "weekly_reset", 0) or 0)
+        w_hrs = w_min = 0
+        if w_reset > 0:
+            w_left = max(0, int(w_reset - now_ts))
+            w_hrs = w_left // 3600
+            w_min = (w_left % 3600) // 60
+        a_scoped_label = str(getattr(raw, "scoped_label", "") or "")
+        a_scoped_pct: float | None = None
+        a_scoped_hrs = a_scoped_min = 0
+        if a_scoped_label:
+            a_scoped_pct = max(0.0, min(1.0, float(
+                getattr(raw, "scoped_utilization", 0.0) or 0.0)))
+            a_scoped_reset = int(getattr(raw, "scoped_reset", 0) or 0)
+            if a_scoped_reset > 0:
+                sc_left = max(0, int(a_scoped_reset - now_ts))
+                a_scoped_hrs = sc_left // 3600
+                a_scoped_min = (sc_left % 3600) // 60
+        claude_accounts.append(SkinAccount(
+            name=name,
+            session_pct=0.0 if err else max(0.0, min(1.0, float(
+                getattr(raw, "session_utilization", 0.0) or 0.0))),
+            session_reset_min=s_reset_min,
+            weekly_pct=0.0 if err else max(0.0, min(1.0, float(
+                getattr(raw, "weekly_utilization", 0.0) or 0.0))),
+            weekly_reset_hrs=w_hrs,
+            weekly_reset_min=w_min,
+            scoped_pct=a_scoped_pct,
+            scoped_reset_hrs=a_scoped_hrs,
+            scoped_reset_min=a_scoped_min,
+            scoped_label=a_scoped_label,
+            error=err,
+        ))
+
     live = getattr(stats, "live_activity", None)
     tpm = float(getattr(live, "tokens_per_minute", 0.0) or 0.0)
     is_live = bool(getattr(live, "is_live", False))
@@ -318,6 +378,7 @@ def from_usage_stats(
         codex_weekly_pct=codex_weekly_pct,
         codex_weekly_reset_hrs=codex_weekly_reset_hrs,
         codex_weekly_reset_min=codex_weekly_reset_min,
+        claude_accounts=claude_accounts,
         live_tok_per_min=tpm / 1000.0,
         is_live=is_live,
         subagent_count=int(getattr(stats, "active_subagent_count", 0) or 0),

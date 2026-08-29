@@ -10,6 +10,7 @@ import os
 import random
 import ssl
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,22 @@ _USAGE_BASE_DELAY = 0.2         # seconds; doubled each retry, plus jitter
 
 
 @dataclass
+class ClaudeAccountStats:
+    """Plan utilisation for one Claude OAuth account / subscription."""
+
+    name: str = ""
+    subscription_type: str = ""
+    session_utilization: float = 0.0
+    session_reset: int = 0
+    weekly_utilization: float = 0.0
+    weekly_reset: int = 0
+    scoped_utilization: float = 0.0
+    scoped_reset: int = 0
+    scoped_label: str = ""
+    error: str = ""
+
+
+@dataclass
 class UsageStats:
     """Aggregated usage statistics from local data and API rate limits."""
 
@@ -87,6 +104,10 @@ class UsageStats:
     codex_session_reset: int = 0
     codex_weekly_utilization: float = 0.0
     codex_weekly_reset: int = 0
+    # Optional multi-Claude subscriptions. When 2+ accounts are configured via
+    # `claude_accounts`, the OSD draws labeled 5h/7d rows per account instead of
+    # a single anonymous Session/Weekly pair. Empty = single-account mode.
+    claude_accounts: list[ClaudeAccountStats] = field(default_factory=list)
     overage_status: str = ""  # "rejected" or "allowed"
     fallback_status: str = ""  # "available" or ""
     rate_limit_error: str = ""  # error message if API call fails
@@ -547,6 +568,11 @@ def get_active_sessions(claude_dir: str) -> list[dict[str, Any]]:
 def _load_subscription_type(claude_dir: str) -> str:
     """Return subscription type ("max", "pro", "free", ...) from credentials, or ""."""
     creds_path = os.path.join(claude_dir, ".credentials.json")
+    return _load_subscription_type_from_path(creds_path)
+
+
+def _load_subscription_type_from_path(creds_path: str) -> str:
+    """Return subscription type from a credentials JSON path, or ""."""
     if not os.path.isfile(creds_path):
         return ""
     try:
@@ -577,6 +603,173 @@ def _extract_token(blob: str) -> str | None:
     return token or None
 
 
+# Claude Code's public OAuth client id + token endpoint. Used to refresh
+# multi-account credential files that Claude Code itself is not keeping warm.
+_CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_CODE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+_CLAUDE_CODE_OAUTH_SCOPE = (
+    "user:profile user:inference user:sessions:claude_code "
+    "user:mcp_servers user:file_upload"
+)
+# Refresh a few minutes before expiresAt so a poll never rides a dead token.
+_OAUTH_REFRESH_SKEW_MS = 5 * 60 * 1000
+
+
+def _oauth_expires_at_ms(oauth: dict[str, Any]) -> int:
+    """Return ``expiresAt`` as epoch milliseconds (0 if missing/invalid)."""
+    raw = oauth.get("expiresAt")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    # Claude Code writes ms; tolerate seconds-scale values just in case.
+    if 0 < val < 10_000_000_000:
+        return val * 1000
+    return max(0, val)
+
+
+def _refresh_oauth_tokens(refresh_token: str) -> dict[str, Any] | None:
+    """Exchange a Claude Code refresh token for a new access/refresh pair.
+
+    Returns ``{"access_token", "refresh_token", "expires_at_ms"}`` on success,
+    or ``None`` on any failure (network, 4xx, malformed body).
+    """
+    refresh_token = (refresh_token or "").strip()
+    if not refresh_token:
+        return None
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": _CLAUDE_CODE_OAUTH_CLIENT_ID,
+        "scope": _CLAUDE_CODE_OAUTH_SCOPE,
+    }).encode()
+    req = Request(
+        _CLAUDE_CODE_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-usage-widget",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=15, context=_ssl_context()) as resp:
+            payload = json.loads(resp.read(65536).decode("utf-8", errors="replace"))
+    except (HTTPError, URLError, OSError, TimeoutError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    access = str(payload.get("access_token") or "").strip()
+    if not access:
+        return None
+    new_refresh = str(payload.get("refresh_token") or refresh_token).strip() or refresh_token
+    try:
+        expires_in = int(payload.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 0
+    if expires_in <= 0:
+        expires_in = 8 * 3600
+    expires_at_ms = int(time.time() * 1000) + expires_in * 1000
+    return {
+        "access_token": access,
+        "refresh_token": new_refresh,
+        "expires_at_ms": expires_at_ms,
+    }
+
+
+def _write_refreshed_oauth(creds_path: str, refreshed: dict[str, Any]) -> bool:
+    """Persist a refreshed OAuth triple back into *creds_path* atomically.
+
+    Preserves every other field Claude Code stores (scopes, subscriptionType,
+    rateLimitTier, mcpOAuth, …) so we never strip metadata Claude Code needs.
+    """
+    try:
+        with open(creds_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    oauth = dict(oauth)
+    oauth["accessToken"] = refreshed["access_token"]
+    oauth["refreshToken"] = refreshed["refresh_token"]
+    oauth["expiresAt"] = int(refreshed["expires_at_ms"])
+    data = dict(data)
+    data["claudeAiOauth"] = oauth
+    try:
+        directory = os.path.dirname(creds_path) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".creds-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(data, out, indent=2)
+                out.write("\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_path, creds_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_fresh_oauth_token(creds_path: str) -> str | None:
+    """Return a non-expired access token from *creds_path*, refreshing if needed.
+
+    Multi-account credential copies go stale once Claude Code stops using them;
+    without a refresh the widget would show 0% forever even though the
+    ``refreshToken`` is still valid. On success the file is rewritten in place.
+    """
+    if not os.path.isfile(creds_path):
+        return None
+    try:
+        with open(creds_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    access = str(oauth.get("accessToken") or "").strip()
+    expires_at = _oauth_expires_at_ms(oauth)
+    now_ms = int(time.time() * 1000)
+    if access and expires_at and expires_at > now_ms + _OAUTH_REFRESH_SKEW_MS:
+        return access
+    # Expired / near-expiry / missing expiry — try refresh.
+    refresh = str(oauth.get("refreshToken") or "").strip()
+    if not refresh:
+        return access or None
+    refreshed = _refresh_oauth_tokens(refresh)
+    if refreshed is None:
+        # Refresh failed (invalid_grant / network). If the access token is
+        # already past expiresAt, returning it only produces confusing 401/429
+        # noise — treat as no usable token so the UI can say re-login.
+        if access and expires_at and expires_at > now_ms:
+            return access
+        return None
+    _write_refreshed_oauth(creds_path, refreshed)
+    return refreshed["access_token"]
+
+
+def _load_credentials_from_path(creds_path: str) -> str | None:
+    """Load an OAuth access token from a credentials JSON file path.
+
+    Refreshes via the Claude Code OAuth endpoint when ``expiresAt`` is past
+    (or within a few minutes), writing the new tokens back to *creds_path*.
+    """
+    return _ensure_fresh_oauth_token(creds_path)
+
+
 def _load_credentials(claude_dir: str) -> str | None:
     """Load the OAuth access token, mirroring Claude Code's own lookup order.
 
@@ -595,15 +788,9 @@ def _load_credentials(claude_dir: str) -> str | None:
 
     # 1. Flat credentials file (Linux + macOS).
     creds_path = os.path.join(claude_dir, ".credentials.json")
-    if os.path.isfile(creds_path):
-        try:
-            with open(creds_path, encoding="utf-8", errors="replace") as f:
-                blob = f.read()
-            token = _extract_token(blob)
-            if token:
-                return token
-        except OSError:
-            pass  # Unreadable; fall through to the Keychain on macOS.
+    token = _load_credentials_from_path(creds_path)
+    if token:
+        return token
 
     # 2. macOS Keychain fallback. /usr/bin/security is the canonical CLI; try
     # each known service name. Errors are recorded (not silently swallowed)
@@ -625,6 +812,307 @@ def _load_credentials(claude_dir: str) -> str | None:
                     return token
 
     return None
+
+
+def _default_multi_accounts_store_path() -> str:
+    """Path used by ClaudeCodeMultiAccounts (``cc-switch`` / ``cc-sync-oauth``)."""
+    return os.path.join(os.path.expanduser("~"), ".ClaudeCodeMultiAccounts.json")
+
+
+def _account_display_name(metadata: dict[str, Any], fallback: str = "account") -> str:
+    """Pick a short OSD label from a multi-account store metadata block."""
+    for key in ("alias", "displayName", "fullName", "emailAddress", "organizationName"):
+        val = str(metadata.get(key) or "").strip()
+        if val:
+            # Email -> local part; keep short for OSD row labels.
+            if "@" in val and key == "emailAddress":
+                val = val.split("@", 1)[0]
+            return val[:24]
+    org = str(metadata.get("organizationType") or "").strip()
+    if org:
+        return org.replace("claude_", "")[:24]
+    return fallback
+
+
+def _resolve_accounts_from_multi_store(store_path: str) -> list[dict[str, Any]]:
+    """Load account rows from a ClaudeCodeMultiAccounts JSON store.
+
+    Each row is ``{name, store_path, store_key, credentials_obj}`` where
+    ``credentials_obj`` is the embedded credentials dict (same shape as
+    ``.credentials.json``). Tokens are refreshed in-place in the store file.
+    """
+    store_path = os.path.expanduser(store_path)
+    if not os.path.isfile(store_path):
+        return []
+    try:
+        with open(store_path, encoding="utf-8", errors="replace") as f:
+            store = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    accounts = store.get("accounts") if isinstance(store, dict) else None
+    if not isinstance(accounts, list):
+        return []
+
+    resolved: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for idx, entry in enumerate(accounts):
+        if not isinstance(entry, dict):
+            continue
+        creds = entry.get("credentials")
+        if not isinstance(creds, dict) or not isinstance(creds.get("claudeAiOauth"), dict):
+            continue
+        meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        key = str(entry.get("key") or f"idx:{idx}")
+        base = _account_display_name(meta, fallback=f"acct{idx}")
+        name = base
+        n = 2
+        while name.lower() in used_names:
+            name = f"{base}-{n}"
+            n += 1
+        used_names.add(name.lower())
+        resolved.append({
+            "name": name,
+            "store_path": store_path,
+            "store_key": key,
+            "credentials_obj": creds,
+            "subscription_type": str(
+                (creds.get("claudeAiOauth") or {}).get("subscriptionType")
+                or meta.get("organizationType")
+                or ""
+            ).replace("claude_", ""),
+        })
+    return resolved
+
+
+def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve multi-Claude accounts into fetchable credential rows.
+
+    Sources, in order of preference:
+
+    1. Explicit ``claude_accounts`` list — bare names map to
+       ``$claude_dir/accounts/<name>.credentials.json``, or objects with
+       ``{"name", "credentials"}`` paths.
+    2. ``claude_accounts_store`` path (default
+       ``~/.ClaudeCodeMultiAccounts.json`` when the file exists and
+       ``claude_accounts`` is empty) — the ClaudeCodeMultiAccounts /
+       ``cc-switch`` store, with embedded credential snapshots.
+
+    Returns an empty list when multi-account mode is not configured.
+    """
+    raw = config.get("claude_accounts") or []
+    if isinstance(raw, list) and raw:
+        claude_dir = str(config.get("claude_dir") or os.path.expanduser("~/.claude"))
+        resolved: list[dict[str, Any]] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                name = entry.strip()
+                if not name:
+                    continue
+                path = os.path.join(claude_dir, "accounts", f"{name}.credentials.json")
+            elif isinstance(entry, dict):
+                name = str(entry.get("name") or "").strip()
+                path = str(entry.get("credentials") or entry.get("path") or "").strip()
+                if not name and path:
+                    base = os.path.basename(path)
+                    name = base.replace(".credentials.json", "").replace(".json", "") or "account"
+                if not path and name:
+                    path = os.path.join(claude_dir, "accounts", f"{name}.credentials.json")
+                if not name or not path:
+                    continue
+                path = os.path.expanduser(path)
+            else:
+                continue
+            resolved.append({"name": name, "credentials": path})
+        return resolved
+
+    # Auto multi-account store (cc-switch) when present and not disabled.
+    store_cfg = config.get("claude_accounts_store", None)
+    if store_cfg is False or store_cfg == "":
+        return []
+    if store_cfg is None:
+        store_path = _default_multi_accounts_store_path()
+        if not os.path.isfile(store_path):
+            return []
+    else:
+        store_path = os.path.expanduser(str(store_cfg))
+    return _resolve_accounts_from_multi_store(store_path)
+
+
+def _ensure_fresh_oauth_in_store(store_path: str, store_key: str, credentials_obj: dict[str, Any]) -> str | None:
+    """Return a fresh access token for a multi-account store entry, writing back."""
+    oauth = credentials_obj.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    access = str(oauth.get("accessToken") or "").strip()
+    expires_at = _oauth_expires_at_ms(oauth)
+    now_ms = int(time.time() * 1000)
+    if access and expires_at and expires_at > now_ms + _OAUTH_REFRESH_SKEW_MS:
+        return access
+    refresh = str(oauth.get("refreshToken") or "").strip()
+    if not refresh:
+        if access and expires_at and expires_at > now_ms:
+            return access
+        return None
+    refreshed = _refresh_oauth_tokens(refresh)
+    if refreshed is None:
+        if access and expires_at and expires_at > now_ms:
+            return access
+        return None
+
+    # Update the in-memory blob and persist the whole store entry.
+    oauth = dict(oauth)
+    oauth["accessToken"] = refreshed["access_token"]
+    oauth["refreshToken"] = refreshed["refresh_token"]
+    oauth["expiresAt"] = int(refreshed["expires_at_ms"])
+    credentials_obj = dict(credentials_obj)
+    credentials_obj["claudeAiOauth"] = oauth
+    try:
+        with open(store_path, encoding="utf-8", errors="replace") as f:
+            store = json.load(f)
+        if not isinstance(store, dict) or not isinstance(store.get("accounts"), list):
+            return refreshed["access_token"]
+        for i, entry in enumerate(store["accounts"]):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("key") or "") != store_key:
+                continue
+            entry = dict(entry)
+            entry["credentials"] = credentials_obj
+            entry["lastSyncedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+            store["accounts"][i] = entry
+            store["updatedAt"] = entry["lastSyncedAt"]
+            directory = os.path.dirname(store_path) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".macc-", suffix=".tmp", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    json.dump(store, out, indent=2)
+                    out.write("\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(tmp_path, store_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            break
+    except (OSError, json.JSONDecodeError):
+        pass
+    return refreshed["access_token"]
+
+
+def fetch_rate_limits_from_account_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Fetch plan utilisation for one resolved multi-account row."""
+    # Path-based snapshots (legacy ~/.claude/accounts/*.json).
+    path = str(spec.get("credentials") or "").strip()
+    if path:
+        return fetch_rate_limits_from_credentials(path)
+
+    # ClaudeCodeMultiAccounts store entry with embedded credentials.
+    store_path = str(spec.get("store_path") or "").strip()
+    store_key = str(spec.get("store_key") or "").strip()
+    creds_obj = spec.get("credentials_obj")
+    if store_path and store_key and isinstance(creds_obj, dict):
+        token = _ensure_fresh_oauth_in_store(store_path, store_key, creds_obj)
+        if not token:
+            return {"error": f"No valid credentials for store account {spec.get('name')!r} "
+                             f"-- run cc-sync-oauth after logging in"}
+        return fetch_rate_limits_for_token(token)
+
+    return {"error": "Invalid account spec"}
+
+
+def _account_stats_from_rate_limits(
+    name: str,
+    subscription_type: str,
+    rate_limits: dict[str, Any],
+) -> ClaudeAccountStats:
+    """Map a ``fetch_rate_limits`` result onto :class:`ClaudeAccountStats`."""
+    if "error" in rate_limits:
+        return ClaudeAccountStats(
+            name=name,
+            subscription_type=subscription_type,
+            error=str(rate_limits.get("error") or "error"),
+        )
+    return ClaudeAccountStats(
+        name=name,
+        subscription_type=subscription_type,
+        session_utilization=float(rate_limits.get("session_utilization", 0.0) or 0.0),
+        session_reset=int(rate_limits.get("session_reset", 0) or 0),
+        weekly_utilization=float(rate_limits.get("weekly_utilization", 0.0) or 0.0),
+        weekly_reset=int(rate_limits.get("weekly_reset", 0) or 0),
+        scoped_utilization=float(rate_limits.get("scoped_utilization", 0.0) or 0.0),
+        scoped_reset=int(rate_limits.get("scoped_reset", 0) or 0),
+        scoped_label=str(rate_limits.get("scoped_label", "") or ""),
+    )
+
+
+def _apply_rate_limits_to_stats(stats: UsageStats, rate_limits: dict[str, Any]) -> None:
+    """Copy a successful rate-limit payload onto the primary UsageStats fields."""
+    stats.session_utilization = float(rate_limits.get("session_utilization", 0.0) or 0.0)
+    stats.session_reset = int(rate_limits.get("session_reset", 0) or 0)
+    stats.weekly_utilization = float(rate_limits.get("weekly_utilization", 0.0) or 0.0)
+    stats.weekly_reset = int(rate_limits.get("weekly_reset", 0) or 0)
+    stats.scoped_utilization = float(rate_limits.get("scoped_utilization", 0.0) or 0.0)
+    stats.scoped_reset = int(rate_limits.get("scoped_reset", 0) or 0)
+    stats.scoped_label = str(rate_limits.get("scoped_label", "") or "")
+    stats.overage_status = str(rate_limits.get("overage_status", "") or "")
+    stats.fallback_status = str(rate_limits.get("fallback_status", "") or "")
+
+
+def fetch_rate_limits_for_token(token: str) -> dict[str, Any]:
+    """Fetch plan utilisation for an explicit OAuth/API token."""
+    token = (token or "").strip()
+    if not token:
+        return {"error": "No credentials found -- run 'claude' to log in"}
+
+    primary = _fetch_oauth_usage(token)
+    if "error" not in primary:
+        return primary
+    if primary.get("rate_limited"):
+        return primary
+    if token.startswith("sk-ant-oat"):
+        return primary
+
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "h"}],
+    }).encode()
+    req = Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": token,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=15, context=_ssl_context()) as resp:
+            headers = {k.lower(): v for k, v in resp.getheaders()}
+    except HTTPError as e:
+        if e.code == 401:
+            return {"error": "Credentials expired -- re-authenticate with 'claude'"}
+        if e.code == 429:
+            headers = {k.lower(): v for k, v in e.headers.items()}
+            prefix = "anthropic-ratelimit-unified-"
+            if any(k.startswith(prefix) for k in headers):
+                return _parse_rate_limit_headers(headers)
+            return {"error": "Rate limited -- try again later"}
+        return {"error": f"API error {e.code}"}
+    except (URLError, OSError, TimeoutError):
+        return {"error": "API request failed -- check network"}
+    return _parse_rate_limit_headers(headers)
+
+
+def fetch_rate_limits_from_credentials(creds_path: str) -> dict[str, Any]:
+    """Fetch plan utilisation using a specific credentials JSON file."""
+    token = _load_credentials_from_path(creds_path)
+    if not token:
+        return {"error": f"No credentials found in {creds_path}"}
+    return fetch_rate_limits_for_token(token)
 
 
 @functools.lru_cache(maxsize=1)
@@ -666,58 +1154,7 @@ def fetch_rate_limits(claude_dir: str) -> dict[str, Any]:
                              "Terminal and click 'Always Allow' on the Keychain "
                              "prompt (or set CLAUDE_CODE_OAUTH_TOKEN)"}
         return {"error": "No credentials found -- run 'claude' to log in"}
-
-    # Primary path — the OAuth usage endpoint Claude Code itself uses.
-    primary = _fetch_oauth_usage(token)
-    if "error" not in primary:
-        return primary
-    # If we were merely rate-limited, return that calm state directly. The
-    # /v1/messages fallback below sends the OAuth token as an x-api-key,
-    # which always 401s for OAuth users and would mislabel a throttle as
-    # "credentials expired" — exactly the bug we're avoiding here.
-    if primary.get("rate_limited"):
-        return primary
-    # Same reasoning for EVERY other primary failure when the token is an
-    # OAuth token (sk-ant-oat…): it can never authenticate as an x-api-key,
-    # so the fallback would turn any transient 5xx/timeout into a false
-    # "Credentials expired". Only attempt the fallback for real API keys.
-    if token.startswith("sk-ant-oat"):
-        return primary
-
-    # Fallback: tiny /v1/messages call to harvest rate-limit headers. These
-    # cover API-key-level limits (not plan limits) but are better than
-    # nothing if the OAuth endpoint is unreachable or 4xxs.
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "h"}],
-    }).encode()
-    req = Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "x-api-key": token,
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20",
-            "content-type": "application/json",
-        },
-    )
-    try:
-        with urlopen(req, timeout=15, context=_ssl_context()) as resp:
-            headers = {k.lower(): v for k, v in resp.getheaders()}
-    except HTTPError as e:
-        if e.code == 401:
-            return {"error": "Credentials expired -- re-authenticate with 'claude'"}
-        if e.code == 429:
-            headers = {k.lower(): v for k, v in e.headers.items()}
-            prefix = "anthropic-ratelimit-unified-"
-            if any(k.startswith(prefix) for k in headers):
-                return _parse_rate_limit_headers(headers)
-            return {"error": "Rate limited -- try again later"}
-        return {"error": f"API error {e.code}"}
-    except (URLError, OSError, TimeoutError):
-        return {"error": "API request failed -- check network"}
-    return _parse_rate_limit_headers(headers)
+    return fetch_rate_limits_for_token(token)
 
 
 def _parse_retry_after(headers) -> float | None:
@@ -1036,7 +1473,12 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
         last_fetch_ts = os.path.getmtime(samples_path)
     except OSError:
         last_fetch_ts = 0.0
-    if sl_live is not None and (now_ts - last_fetch_ts) < endpoint_min:
+    # Multi-Claude mode fetches each account's credentials below; skip the
+    # default single-token endpoint call so we don't double-hit the budget.
+    multi_account = len(_resolve_claude_accounts(config)) >= 2
+    if multi_account:
+        rate_limits = None
+    elif sl_live is not None and (now_ts - last_fetch_ts) < endpoint_min:
         stats.session_utilization, stats.session_reset = sl_live["session"]
         stats.weekly_utilization, stats.weekly_reset = sl_live["weekly"]
         # Scoped cap isn't in the statusline payload — carry the last
@@ -1321,5 +1763,60 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
             stats.codex_weekly_reset = int(cx["weekly_reset"])
         except Exception:
             stats.codex_available = False
+
+    # Optional multi-Claude subscriptions. When 2+ accounts are configured,
+    # fetch each credentials file and expose labeled rows on the OSD. Primary
+    # session/weekly fields stay populated from the first successful account
+    # so the rest of the app keeps working in single-account mode.
+    account_specs = _resolve_claude_accounts(config)
+    if len(account_specs) >= 2:
+        accounts: list[ClaudeAccountStats] = []
+        primary_applied = False
+        for spec in account_specs:
+            name = str(spec.get("name") or "account")
+            path = str(spec.get("credentials") or "")
+            sub = str(spec.get("subscription_type") or "")
+            if not sub and path:
+                sub = _load_subscription_type_from_path(path)
+            if not sub and isinstance(spec.get("credentials_obj"), dict):
+                sub = str(
+                    (spec["credentials_obj"].get("claudeAiOauth") or {})
+                    .get("subscriptionType") or ""
+                )
+            try:
+                acct_limits = fetch_rate_limits_from_account_spec(spec)
+            except Exception as exc:
+                acct_limits = {"error": f"fetch failed: {exc}"}
+            acct = _account_stats_from_rate_limits(name, sub, acct_limits)
+            accounts.append(acct)
+            if not primary_applied and not acct.error:
+                _apply_rate_limits_to_stats(stats, acct_limits)
+                if sub:
+                    stats.subscription_type = sub
+                primary_applied = True
+                stats.rate_limit_error = ""
+        stats.claude_accounts = accounts
+        if primary_applied:
+            # Keep the utilisation history file fresh from the primary account
+            # so sparkline/forecast paths still work in multi-Claude mode.
+            try:
+                append_sample(
+                    samples_path, now_ts,
+                    stats.session_utilization, stats.weekly_utilization,
+                    session_reset=stats.session_reset,
+                    weekly_reset=stats.weekly_reset,
+                    scoped=stats.scoped_utilization,
+                    scoped_reset=stats.scoped_reset,
+                    scoped_label=stats.scoped_label,
+                )
+                prune(samples_path, keep_seconds=HISTORY_KEEP_DAYS * 86400, now=now_ts)
+            except OSError:
+                pass
+        elif accounts:
+            # Every account failed — surface the first error on the primary
+            # field so the popup/CLI still have something actionable.
+            first_err = next((a.error for a in accounts if a.error), "")
+            if first_err and not stats.rate_limit_error:
+                stats.rate_limit_error = first_err
 
     return stats

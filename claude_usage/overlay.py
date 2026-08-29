@@ -56,6 +56,11 @@ GAUGE_HEIGHT = 130
 # Extra height for the optional Codex ring row (a second Session/Weekly pair
 # drawn beneath Claude's; same stack minus the shared top padding).
 CODEX_GAUGE_ROW_HEIGHT = 118
+# Multi-Claude mode replaces the single Session/Weekly pair with N labeled
+# account pairs. Extra height beyond the first account pair (each pair is two
+# SCOPED_ROW_HEIGHT rows in bars mode, one CODEX_GAUGE_ROW_HEIGHT in gauge).
+ACCOUNT_PAIR_BARS_HEIGHT = 2 * SCOPED_ROW_HEIGHT
+ACCOUNT_PAIR_GAUGE_HEIGHT = CODEX_GAUGE_ROW_HEIGHT
 
 # Supported OSD view modes. Kept as string constants so config files and
 # tests don't have to import an enum.
@@ -227,6 +232,8 @@ class UsageOverlay(QWidget):
         self._codex_session_reset: int = 0
         self._codex_weekly_pct: float = 0.0
         self._codex_weekly_reset: int = 0
+        # Multi-Claude accounts (2+). Empty => single Session/Weekly pair.
+        self._claude_accounts: list = []
         self._live_tpm: float = 0.0      # tokens/min over the last few minutes
         self._is_live: bool = False       # show the "● LIVE" dot
         self._burn_alert = None           # active burn/spike/storm badge (or None)
@@ -326,6 +333,7 @@ class UsageOverlay(QWidget):
         # Optional Codex provider rows — like scoped, their appearance or
         # disappearance changes the OSD footprint.
         had_codex = self._codex_available
+        had_accounts = len(self._claude_accounts)
         self._codex_available = bool(getattr(stats, "codex_available", False))
         self._codex_session_pct = max(0.0, min(1.0, float(
             getattr(stats, "codex_session_utilization", 0.0) or 0.0)))
@@ -333,7 +341,12 @@ class UsageOverlay(QWidget):
         self._codex_weekly_pct = max(0.0, min(1.0, float(
             getattr(stats, "codex_weekly_utilization", 0.0) or 0.0)))
         self._codex_weekly_reset = int(getattr(stats, "codex_weekly_reset", 0) or 0)
-        if bool(self._scoped_label) != had_scoped or self._codex_available != had_codex:
+        self._claude_accounts = list(getattr(stats, "claude_accounts", []) or [])
+        if (
+            bool(self._scoped_label) != had_scoped
+            or self._codex_available != had_codex
+            or len(self._claude_accounts) != had_accounts
+        ):
             self._apply_size()
         live = getattr(stats, "live_activity", None)
         if live is not None:
@@ -495,8 +508,21 @@ class UsageOverlay(QWidget):
         """
         m = self._skin.METRICS
         base = m["osd_height"]
-        if self._scoped_label:
-            base = m.get("osd_height_scoped", base + SCOPED_ROW_HEIGHT)
+        multi = len(self._claude_accounts) >= 2
+        if multi:
+            # First account pair replaces the default session/weekly rows
+            # already included in osd_height; each extra account adds a pair.
+            extra_pairs = len(self._claude_accounts) - 1
+            pair_h = m.get("account_pair_height", m.get("codex_rows_height", 2 * SCOPED_ROW_HEIGHT))
+            base += extra_pairs * pair_h
+            # In multi-account mode the primary scoped bar is suppressed;
+            # per-account scoped caps are drawn inside each account block.
+            for acct in self._claude_accounts:
+                if str(getattr(acct, "scoped_label", "") or ""):
+                    base += m.get("scoped_row_height", SCOPED_ROW_HEIGHT)
+        else:
+            if self._scoped_label:
+                base = m.get("osd_height_scoped", base + SCOPED_ROW_HEIGHT)
         if self._codex_available:
             base += m.get("codex_rows_height", 2 * SCOPED_ROW_HEIGHT)
         return base
@@ -520,8 +546,16 @@ class UsageOverlay(QWidget):
             return
 
         width = int(BASE_WIDTH * self._scale)
+        multi = len(self._claude_accounts) >= 2
         if self._view_mode == VIEW_MODE_GAUGE:
-            base = GAUGE_HEIGHT + (SCOPED_ROW_HEIGHT if self._scoped_label else 0)
+            if multi:
+                base = GAUGE_HEIGHT + (len(self._claude_accounts) - 1) * ACCOUNT_PAIR_GAUGE_HEIGHT
+                # Per-account scoped bars under the rings.
+                for acct in self._claude_accounts:
+                    if str(getattr(acct, "scoped_label", "") or ""):
+                        base += SCOPED_ROW_HEIGHT
+            else:
+                base = GAUGE_HEIGHT + (SCOPED_ROW_HEIGHT if self._scoped_label else 0)
             if self._codex_available:
                 base += CODEX_GAUGE_ROW_HEIGHT
         else:
@@ -529,7 +563,13 @@ class UsageOverlay(QWidget):
             # even if the user disabled the ticker feature.
             wants_footer = self._ticker_enabled or self._style.decoration == "receipt"
             base = BASE_HEIGHT + (TICKER_STRIP_HEIGHT if wants_footer else 0)
-            if self._scoped_label:
+            if multi:
+                # BASE_HEIGHT already covers one session+weekly pair.
+                base += (len(self._claude_accounts) - 1) * ACCOUNT_PAIR_BARS_HEIGHT
+                for acct in self._claude_accounts:
+                    if str(getattr(acct, "scoped_label", "") or ""):
+                        base += SCOPED_ROW_HEIGHT
+            elif self._scoped_label:
                 base += SCOPED_ROW_HEIGHT
             if self._codex_available:
                 base += 2 * SCOPED_ROW_HEIGHT  # Codex 5h + 7d rows
@@ -843,15 +883,35 @@ class UsageOverlay(QWidget):
             )
 
         # Two columns splitting the panel; each column is one gauge stack.
-        # With the Codex provider active, a second row of rings (Codex 5h /
-        # 7d) is drawn beneath Claude's Session / Weekly pair.
+        # Multi-Claude mode draws one Session/Weekly pair per account.
+        # With the Codex provider active, a Codex 5h/7d pair is drawn last.
         col_w = w / 2
         ring_d = max(50.0, min(col_w * 0.58, 80 * s))
         ring_stroke = max(4.0, 7 * s)
-        ring_rows: list[tuple[tuple[str, float, int], ...]] = [(
-            ("Session", self._session_pct, self._session_reset),
-            ("Weekly",  self._weekly_pct,  self._weekly_reset),
-        )]
+        multi = len(self._claude_accounts) >= 2
+        ring_rows: list[tuple[tuple[str, float, int], ...]] = []
+        if multi:
+            for acct in self._claude_accounts:
+                name = str(getattr(acct, "name", "") or "acct")
+                if getattr(acct, "error", ""):
+                    ring_rows.append((
+                        (f"{name} 5h", 0.0, 0),
+                        (f"{name} 7d", 0.0, 0),
+                    ))
+                else:
+                    ring_rows.append((
+                        (f"{name} 5h",
+                         max(0.0, min(1.0, float(getattr(acct, "session_utilization", 0.0) or 0.0))),
+                         int(getattr(acct, "session_reset", 0) or 0)),
+                        (f"{name} 7d",
+                         max(0.0, min(1.0, float(getattr(acct, "weekly_utilization", 0.0) or 0.0))),
+                         int(getattr(acct, "weekly_reset", 0) or 0)),
+                    ))
+        else:
+            ring_rows.append((
+                ("Session", self._session_pct, self._session_reset),
+                ("Weekly",  self._weekly_pct,  self._weekly_reset),
+            ))
         if self._codex_available:
             ring_rows.append((
                 ("Codex 5h", self._codex_session_pct, self._codex_session_reset),
@@ -909,18 +969,33 @@ class UsageOverlay(QWidget):
                 p.setPen(_hex_to_qcolor(color))
                 p.drawText(QPointF(w / 2 - bwid / 2, 10 * s), btext)
 
-        # Scoped weekly cap — a slim full-width bar spanning both columns
-        # beneath the rings (a third ring would unbalance the pair).
-        if self._scoped_label:
-            pad_x = 14 * s
-            bar_h = OSD_BAR_HEIGHT * s
-            bar_w = w - 2 * pad_x
-            row_y = h - 22 * s
-            label = f"{self._scoped_label} {int(self._scoped_pct * 100)}%"
+        # Scoped weekly cap(s) — slim full-width bar(s) beneath the rings.
+        # Multi-Claude mode draws one bar per account that reports a scoped
+        # label; single-account mode keeps the historical single bar.
+        pad_x = 14 * s
+        bar_h = OSD_BAR_HEIGHT * s
+        bar_w = w - 2 * pad_x
+        scoped_rows: list[tuple[str, float, int]] = []
+        if multi:
+            for acct in self._claude_accounts:
+                sl = str(getattr(acct, "scoped_label", "") or "")
+                if not sl:
+                    continue
+                name = str(getattr(acct, "name", "") or "acct")
+                scoped_rows.append((
+                    f"{name} {sl}",
+                    max(0.0, min(1.0, float(getattr(acct, "scoped_utilization", 0.0) or 0.0))),
+                    int(getattr(acct, "scoped_reset", 0) or 0),
+                ))
+        elif self._scoped_label:
+            scoped_rows.append((self._scoped_label, self._scoped_pct, self._scoped_reset))
+        for i, (slabel, spct, sreset) in enumerate(reversed(scoped_rows)):
+            row_y = h - (22 + i * SCOPED_ROW_HEIGHT) * s
+            label = f"{slabel} {int(spct * 100)}%"
             p.setFont(_mono_font(max(8, int(9 * s)), bold=True))
             p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
             p.drawText(QPointF(pad_x, row_y), label)
-            reset_label = _format_reset_short(self._scoped_reset)
+            reset_label = _format_reset_short(sreset)
             if reset_label:
                 p.setFont(_mono_font(max(7, int(7.5 * s))))
                 p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
@@ -931,10 +1006,10 @@ class UsageOverlay(QWidget):
             p.setBrush(_hex_to_qcolor(self._theme["bar_track"], 0.6))
             p.drawRoundedRect(QRectF(pad_x, bar_y, bar_w, bar_h),
                               OSD_BAR_RADIUS * s, OSD_BAR_RADIUS * s)
-            if self._scoped_pct > 0:
-                p.setBrush(_bar_color(self._scoped_pct, self._theme))
+            if spct > 0:
+                p.setBrush(_bar_color(spct, self._theme))
                 p.drawRoundedRect(
-                    QRectF(pad_x, bar_y, max(bar_w * self._scoped_pct, bar_h), bar_h),
+                    QRectF(pad_x, bar_y, max(bar_w * spct, bar_h), bar_h),
                     OSD_BAR_RADIUS * s, OSD_BAR_RADIUS * s)
 
     def _draw_ring(
@@ -1056,34 +1131,99 @@ class UsageOverlay(QWidget):
                 p.setPen(_hex_to_qcolor(color))
                 p.drawText(QPointF(badge_right - bwid, title_y), btext)
 
-        # --- Session row ---
+        # --- Session / Weekly rows (or multi-Claude labeled pairs) ---
         y = pad_y + 16 * s
-        self._draw_row(
-            p, y, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
-            label="Session",
-            pct=self._session_pct,
-            reset_label=_format_reset_short(self._session_reset),
-        )
-
-        # --- Weekly row ---
-        y2 = y + 15 * s + bar_h + 10 * s
-        self._draw_row(
-            p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
-            label="Weekly",
-            pct=self._weekly_pct,
-            reset_label=_format_reset_short(self._weekly_reset),
-        )
-
-        # --- Scoped weekly row (e.g. "Fable") — only when the API reports it ---
-        if self._scoped_label:
-            y3 = y2 + 15 * s + bar_h + 10 * s
+        multi = len(self._claude_accounts) >= 2
+        if multi:
+            y2 = y
+            first = True
+            for acct in self._claude_accounts:
+                name = str(getattr(acct, "name", "") or "acct")
+                if not first:
+                    y2 = y2 + 15 * s + bar_h + 10 * s
+                first = False
+                if getattr(acct, "error", ""):
+                    err = str(acct.error)
+                    # Compact reason for the reset column — full text is too wide.
+                    if "expired" in err.lower() or "re-authenticate" in err.lower():
+                        reason = "re-login"
+                    elif "rate limited" in err.lower():
+                        reason = "throttled"
+                    elif "No credentials" in err:
+                        reason = "no creds"
+                    else:
+                        reason = "error"
+                    self._draw_row(
+                        p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                        label=f"{name} 5h",
+                        pct=0.0,
+                        reset_label=reason,
+                    )
+                    y2 = y2 + 15 * s + bar_h + 10 * s
+                    self._draw_row(
+                        p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                        label=f"{name} 7d",
+                        pct=0.0,
+                        reset_label=reason,
+                    )
+                else:
+                    sess_pct = max(0.0, min(1.0, float(
+                        getattr(acct, "session_utilization", 0.0) or 0.0)))
+                    week_pct = max(0.0, min(1.0, float(
+                        getattr(acct, "weekly_utilization", 0.0) or 0.0)))
+                    self._draw_row(
+                        p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                        label=f"{name} 5h",
+                        pct=sess_pct,
+                        reset_label=_format_reset_short(
+                            int(getattr(acct, "session_reset", 0) or 0)),
+                    )
+                    y2 = y2 + 15 * s + bar_h + 10 * s
+                    self._draw_row(
+                        p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                        label=f"{name} 7d",
+                        pct=week_pct,
+                        reset_label=_format_reset_short(
+                            int(getattr(acct, "weekly_reset", 0) or 0)),
+                    )
+                    slabel = str(getattr(acct, "scoped_label", "") or "")
+                    if slabel:
+                        y2 = y2 + 15 * s + bar_h + 10 * s
+                        self._draw_row(
+                            p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                            label=f"{name} {slabel}",
+                            pct=max(0.0, min(1.0, float(
+                                getattr(acct, "scoped_utilization", 0.0) or 0.0))),
+                            reset_label=_format_reset_short(
+                                int(getattr(acct, "scoped_reset", 0) or 0)),
+                        )
+        else:
             self._draw_row(
-                p, y3, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
-                label=self._scoped_label,
-                pct=self._scoped_pct,
-                reset_label=_format_reset_short(self._scoped_reset),
+                p, y, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                label="Session",
+                pct=self._session_pct,
+                reset_label=_format_reset_short(self._session_reset),
             )
-            y2 = y3  # push the footer below the extra row
+
+            # --- Weekly row ---
+            y2 = y + 15 * s + bar_h + 10 * s
+            self._draw_row(
+                p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                label="Weekly",
+                pct=self._weekly_pct,
+                reset_label=_format_reset_short(self._weekly_reset),
+            )
+
+            # --- Scoped weekly row (e.g. "Fable") — only when the API reports it ---
+            if self._scoped_label:
+                y3 = y2 + 15 * s + bar_h + 10 * s
+                self._draw_row(
+                    p, y3, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
+                    label=self._scoped_label,
+                    pct=self._scoped_pct,
+                    reset_label=_format_reset_short(self._scoped_reset),
+                )
+                y2 = y3  # push the footer below the extra row
 
         # --- Codex provider rows — only when the codex provider is active ---
         if self._codex_available:

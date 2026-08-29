@@ -121,50 +121,75 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
         lw = QFontMetrics(body_f).horizontalAdvance(live_text)
         draw_text(p, x + w - lw, baseline, live_text, hex_to_qcolor(t["accent"]), body_f)
 
-    # session row
-    y_row = y + line_h + m["osd_row_gap"] * s
-    draw_text(p, x, y_row + fm.ascent(), "session",
-              hex_to_qcolor(t["text_secondary"]), body_f)
-    right = f"{data.session_reset_min}m · {int(data.session_pct*100)}%"
-    rw = fm.horizontalAdvance(right)
-    draw_text(p, x + w - rw, y_row + fm.ascent(), right,
-              hex_to_qcolor(t["text_secondary"]), body_f)
-    y_bar = y_row + line_h + 2 * s
-    draw_ascii_bar(p, x, y_bar + fm.ascent(), data.session_pct,
-                   m["osd_bar_cols"],
-                   hex_to_qcolor(t["accent"]), hex_to_qcolor(t["very_dim"]),
-                   body_f)
-
-    # weekly row
-    y_row = y_bar + line_h + m["osd_row_gap"] * s
-    draw_text(p, x, y_row + fm.ascent(), "weekly",
-              hex_to_qcolor(t["text_secondary"]), body_f)
-    right = f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m · {int(data.weekly_pct*100)}%"
-    rw = fm.horizontalAdvance(right)
-    draw_text(p, x + w - rw, y_row + fm.ascent(), right,
-              hex_to_qcolor(t["text_secondary"]), body_f)
-    y_bar = y_row + line_h + 2 * s
-    draw_ascii_bar(p, x, y_bar + fm.ascent(), data.weekly_pct,
-                   m["osd_bar_cols"],
-                   hex_to_qcolor(t["accent"]), hex_to_qcolor(t["very_dim"]),
-                   body_f)
-
-    # scoped weekly row — optional model-scoped cap (e.g. "fable"). Only
-    # drawn when the API reports it; mirrors the weekly row exactly and
-    # pushes the ticker below down by one row via the updated y_bar.
-    if getattr(data, "scoped_pct", None) is not None and getattr(data, "scoped_label", ""):
-        y_row = y_bar + line_h + m["osd_row_gap"] * s
-        draw_text(p, x, y_row + fm.ascent(), data.scoped_label.lower(),
+    def _term_row(label: str, pct: float, right: str, y_bar_in: float) -> float:
+        y_row = y_bar_in + line_h + m["osd_row_gap"] * s if y_bar_in >= 0 else (
+            y + line_h + m["osd_row_gap"] * s
+        )
+        if y_bar_in < 0:
+            y_row = y + line_h + m["osd_row_gap"] * s
+        else:
+            y_row = y_bar_in + line_h + m["osd_row_gap"] * s
+        draw_text(p, x, y_row + fm.ascent(), label,
                   hex_to_qcolor(t["text_secondary"]), body_f)
-        right = f"{data.scoped_reset_hrs}h {data.scoped_reset_min}m · {int(data.scoped_pct*100)}%"
         rw = fm.horizontalAdvance(right)
         draw_text(p, x + w - rw, y_row + fm.ascent(), right,
                   hex_to_qcolor(t["text_secondary"]), body_f)
-        y_bar = y_row + line_h + 2 * s
-        draw_ascii_bar(p, x, y_bar + fm.ascent(), data.scoped_pct,
+        y_bar_out = y_row + line_h + 2 * s
+        draw_ascii_bar(p, x, y_bar_out + fm.ascent(), pct,
                        m["osd_bar_cols"],
                        hex_to_qcolor(t["accent"]), hex_to_qcolor(t["very_dim"]),
                        body_f)
+        return y_bar_out
+
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
+    y_bar = -1.0
+    if multi:
+        for i, acct in enumerate(accounts):
+            name = (getattr(acct, "name", "") or "acct").lower()
+            y_bar = _term_row(
+                f"{name} 5h",
+                float(getattr(acct, "session_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'session_reset_min', 0) or 0)}m · "
+                f"{int(float(getattr(acct, 'session_pct', 0.0) or 0.0)*100)}%",
+                y_bar,
+            )
+            y_bar = _term_row(
+                f"{name} 7d",
+                float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}h "
+                f"{int(getattr(acct, 'weekly_reset_min', 0) or 0)}m · "
+                f"{int(float(getattr(acct, 'weekly_pct', 0.0) or 0.0)*100)}%",
+                y_bar,
+            )
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                y_bar = _term_row(
+                    f"{name} {acct.scoped_label.lower()}",
+                    float(acct.scoped_pct),
+                    f"{int(acct.scoped_reset_hrs)}h {int(acct.scoped_reset_min)}m · "
+                    f"{int(float(acct.scoped_pct)*100)}%",
+                    y_bar,
+                )
+    else:
+        # session row
+        y_bar = _term_row(
+            "session", data.session_pct,
+            f"{data.session_reset_min}m · {int(data.session_pct*100)}%",
+            -1.0,
+        )
+        # weekly row
+        y_bar = _term_row(
+            "weekly", data.weekly_pct,
+            f"{data.weekly_reset_hrs}h {data.weekly_reset_min}m · {int(data.weekly_pct*100)}%",
+            y_bar,
+        )
+        # scoped weekly row — optional model-scoped cap (e.g. "fable").
+        if getattr(data, "scoped_pct", None) is not None and getattr(data, "scoped_label", ""):
+            y_bar = _term_row(
+                data.scoped_label.lower(), data.scoped_pct,
+                f"{data.scoped_reset_hrs}h {data.scoped_reset_min}m · {int(data.scoped_pct*100)}%",
+                y_bar,
+            )
 
     # codex rows — optional second-provider (OpenAI Codex) 5h + 7d windows.
     # Mirrors the session/weekly rows exactly and pushes the ticker below

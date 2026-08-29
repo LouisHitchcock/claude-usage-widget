@@ -97,6 +97,7 @@ Gauge variants for every theme are available at `screenshots/osd-gauge-<theme>.p
 - **Real API data** -- 5h / 7d plan utilisation read from Claude Code's `/api/oauth/usage` endpoint (the same data the Claude UI shows)
 - **Model-scoped weekly bar** -- when Anthropic reports a separate weekly cap for a specific model (e.g. **Fable**), a third bar appears automatically below Session and Weekly, labelled with the model name. It auto-hides when the API stops reporting it — works in bars, gauge, all 11 themes, and the detail popup.
 - **Second provider (opt-in)** -- also track your local **OpenAI Codex** usage alongside Claude's: add `"codex"` to the `providers` config and the widget shows Codex 5h/weekly rows beneath Claude's (extra bars in bars view, a 2×2 ring grid in gauge), rendered natively in **all 11 themes**. Auto-hides when the Codex CLI is missing or logged out; off by default. See [Second provider: OpenAI Codex](#second-provider-openai-codex-opt-in).
+- **Multiple Claude accounts (opt-in)** -- track 2+ Claude subscriptions on one OSD with labeled 5h/7d rows (and any model-scoped weekly caps) per account, in bars, gauge, and all 11 themes. Auto-detects `~/.ClaudeCodeMultiAccounts.json` from `cc-switch` / `cc-sync-oauth`, or take an explicit `claude_accounts` path list. The first successful account still feeds the detail popup, forecasts, and sparkline. See [Multiple Claude accounts](#multiple-claude-accounts-opt-in).
 - **OSD overlay** -- transparent, frameless; left-click opens the details popup, right-click shows a context menu. Stays on top by default — toggle it off to use it as a background desktop widget.
 - **Live token stream** -- `● LIVE 5.3k tok/min` badge on the OSD while a Claude Code session is actively writing, derived from the conversation JSONLs
 - **Per-turn cost ticker** -- a scrolling strip at the bottom of the OSD shows the USD cost of each assistant turn as it lands (`$0.156 ← Bash · 116`), colour-coded by quartile within the visible window so the tape always stays visually varied. Toggle via right-click → "Show cost ticker" or set `"show_ticker": false` in `config.json`.
@@ -129,6 +130,7 @@ Gauge variants for every theme are available at `screenshots/osd-gauge-<theme>.p
 
 - Python 3.10+
 - Claude Code CLI installed and authenticated (OAuth) — the widget reads the same token, checking the `CLAUDE_CODE_OAUTH_TOKEN` environment variable first, then `~/.claude/.credentials.json`, then the macOS Keychain
+- Optional: [ClaudeCodeMultiAccounts](https://www.npmjs.com/package/claude-code-multi-accounts) (`cc-switch` / `cc-sync-oauth`) if you want multi-subscription tracking via `~/.ClaudeCodeMultiAccounts.json`
 
 ## Installation
 
@@ -258,6 +260,52 @@ You get two extra rows in bars view — **Codex 5h** and **Codex 7d** — or a s
 
 The default `providers` is `["claude"]`, so existing users see no change.
 
+## Multiple Claude accounts (opt-in)
+
+Track two or more Claude subscriptions on one OSD. Prefer the **ClaudeCodeMultiAccounts** store (recommended): the widget auto-detects `~/.ClaudeCodeMultiAccounts.json` when `claude_accounts` is empty.
+
+### Recommended: `cc-switch` + auto store
+
+1. Install the switcher once:
+
+```bash
+npx claude-code-multi-accounts install
+```
+
+2. For **each** subscription you care about:
+
+```text
+claude          # /login as that account
+cc-sync-oauth   # snapshot it into ~/.ClaudeCodeMultiAccounts.json
+```
+
+3. Restart the widget (`claude-usage`). With 2+ snapshots in the store, the OSD shows labeled rows per account. Tokens are refreshed in the store when possible.
+
+Day-to-day Claude Code switching:
+
+```text
+cc-switch       # list accounts + usage
+cc-switch 1     # make account 1 live (restart Claude Code after)
+cc-sync-oauth   # re-snapshot the live login after a fresh /login
+```
+
+Aliases: `ccs` = `cc-switch`, `ccso` = `cc-sync-oauth`.
+
+### Manual credential paths (alternative)
+
+```json
+{
+    "claude_accounts": [
+        "personal",
+        {"name": "work", "credentials": "~/path/to/work.credentials.json"}
+    ]
+}
+```
+
+Bare names resolve under `$claude_dir/accounts/<name>.credentials.json`. Path-based lists override store auto-detect. Set `"claude_accounts_store": false` to disable auto-detect even when the store file exists.
+
+When 2+ accounts resolve, the OSD draws labeled **5h / 7d** rows (and scoped caps) per account in bars view, gauge view, and every theme/skin. The first successful account still fills primary session/weekly fields for the popup, forecasts, and sparkline. Single-account setups are unchanged: leave `claude_accounts` empty and skip the multi-account store.
+
 ## Configuration
 
 All settings are optional. Copy `config.json.example` to `config.json` and edit the values you want to change:
@@ -288,6 +336,8 @@ cp config.json.example config.json
 | `osd_opacity` | `0.75` | OSD background opacity (0.15--1.0) |
 | `providers` | `["claude"]` | Add `"codex"` to also poll the local OpenAI Codex CLI (`codex app-server`) and show its 5h/weekly usage beneath Claude's — an extra ring row in gauge view, two extra bars in bars view. POSIX-only. |
 | `codex_poll_seconds` | `300` | How often (seconds) to spawn the codex app-server RPC; an on-disk cache is served in between. |
+| `claude_accounts` | `[]` | Optional multi-Claude path list. When 2+ entries are set, labeled 5h/7d rows per account. Bare name or `{"name", "credentials"}`. Empty = auto-use `~/.ClaudeCodeMultiAccounts.json` if present. |
+| `claude_accounts_store` | `null` | Path to a ClaudeCodeMultiAccounts store, or `false`/`""` to disable auto-detect. `null` = `~/.ClaudeCodeMultiAccounts.json` when that file exists and `claude_accounts` is empty. |
 | `daily_message_limit` | `200` | Daily message limit for local tracking in the popup |
 | `weekly_message_limit` | `1000` | Weekly message limit for local tracking in the popup |
 | `daily_token_limit` | `5000000` | Daily token limit for local tracking |
@@ -313,7 +363,7 @@ cp config.json.example config.json
 | `budget_notify_enabled` / `budget_notify_ratio` | `true` / `1.0` | Whether the budget projection notification fires, and at what fraction of the cap (`0.9` warns at 90%). |
 | `burn_alerts_enabled` | `true` | Real-time OSD badge + debounced notification when the 5h window burns fast or a turn / retry-loop spikes tokens. Tune with `burn_warn_pct_per_min` (`2.0`), `burn_crit_pct_per_min` (`5.0`), `burn_window_seconds` (`600`), `spike_token_multiplier` (`4.0`), `spike_min_tokens` (`20000`), `spike_baseline_min_turns` (`5`), `retry_storm_turns` (`3`), `retry_storm_window_seconds` (`120`), `burn_alert_cooldown_seconds` (`900`). |
 
-Keys omitted from `config.json` fall back to built-in defaults, so `config.json.example` is an intentionally minimal starter listing only the most commonly changed keys. Everything else in the table above — the opt-in providers (Codex), statusline/endpoint tuning, the burn / peak / budget alerts, the localhost API, webhooks, and the auto-persisted OSD state — simply uses its default until you add it.
+Keys omitted from `config.json` fall back to built-in defaults, so `config.json.example` is an intentionally minimal starter listing only the most commonly changed keys. Everything else in the table above — the opt-in providers (Codex), multi-Claude accounts, statusline/endpoint tuning, the burn / peak / budget alerts, the localhost API, webhooks, and the auto-persisted OSD state — simply uses its default until you add it.
 
 ## Themes
 
@@ -346,7 +396,7 @@ Every theme also styles the detail popup — see [`screenshots/popup-<theme>.png
 
 ## How It Works
 
-The widget reads your Claude Code OAuth token using the same lookup order as Claude Code itself — the `CLAUDE_CODE_OAUTH_TOKEN` environment variable, then `~/.claude/.credentials.json`, then (macOS only) the Keychain — and calls Claude Code's own `/api/oauth/usage` endpoint, the same one the Claude UI uses, to read your plan-level utilization:
+The widget reads your Claude Code OAuth token using the same lookup order as Claude Code itself — the `CLAUDE_CODE_OAUTH_TOKEN` environment variable, then `~/.claude/.credentials.json`, then (macOS only) the Keychain — and calls Claude Code's own `/api/oauth/usage` endpoint, the same one the Claude UI uses, to read your plan-level utilization. In multi-account mode it instead refreshes each account's token (from path-based credentials or the ClaudeCodeMultiAccounts store) and polls `/api/oauth/usage` once per account:
 
 ```json
 {
@@ -424,13 +474,22 @@ sudo pacman -S libnotify          # Arch
 ### Codex rows disappeared
 The opt-in Codex rows auto-hide whenever `codex app-server` returns no rate-limit data. The most common cause is an expired OpenAI token — run `codex login` and the rows come back on the next poll. They also stay hidden when the `codex` CLI isn't on `PATH`, and on Windows (the provider is POSIX-only).
 
+### Multi-account rows missing or stuck on one account
+- Multi-account mode only activates when **2+** accounts resolve. One snapshot in `~/.ClaudeCodeMultiAccounts.json` (or a single `claude_accounts` entry) stays in normal single-account mode.
+- Re-run `cc-sync-oauth` after each `/login` so the store has a fresh token for every subscription.
+- Path-based `claude_accounts` entries must point at real `.credentials.json` files (bare names resolve under `~/.claude/accounts/<name>.credentials.json`).
+- Set `"claude_accounts_store": false` if a leftover store file is pulling you into multi-account mode unexpectedly.
+
 ### Status shows "Rate limited"
 The usage figures come from Anthropic's `/api/oauth/usage` endpoint, a low-budget endpoint shared with Claude Code. Polling it too often can trip its rate limit; the widget handles this gracefully (it keeps showing your last-known numbers and backs the poll interval off automatically), so it's harmless. If you see it a lot, raise `refresh_seconds` in `config.json`.
 
 ## FAQ
 
 **Does it need an API key?**
-No. It reuses the OAuth token Claude Code already created (env var → `~/.claude/.credentials.json` → macOS Keychain). If the `claude` CLI works, the widget works; it never has credentials of its own.
+No. It reuses the OAuth token Claude Code already created (env var → `~/.claude/.credentials.json` → macOS Keychain). If the `claude` CLI works, the widget works; it never has credentials of its own. Multi-account mode uses the same OAuth snapshots from path-based credentials or `~/.ClaudeCodeMultiAccounts.json`.
+
+**Can it track more than one Claude subscription?**
+Yes. Install ClaudeCodeMultiAccounts, snapshot each login with `cc-sync-oauth`, and restart the widget — or set `claude_accounts` manually. See [Multiple Claude accounts](#multiple-claude-accounts-opt-in).
 
 **Does it cost me anything / use my token budget?**
 The usage fetch hits a lightweight status endpoint, not a model. The only feature that calls a model is the AI weekly report (one short Claude Haiku call, cached for an hour) — and it silently no-ops without a token.

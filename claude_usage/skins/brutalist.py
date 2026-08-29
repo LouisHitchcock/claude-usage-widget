@@ -141,20 +141,36 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
         return ybar + 14 * s + fm_s.height() + 6 * s
 
     yy = y_rule + 10 * s
-    yy = row(yy, "SESSION", data.session_pct,
-             f"RESETS {data.session_reset_min}M", t["accent"])
-    yy = row(yy, "WEEKLY", data.weekly_pct,
-             f"RESETS {data.weekly_reset_hrs}H {data.weekly_reset_min}M",
-             t["ink"])
-    # Optional model-scoped weekly cap (e.g. "Fable") — a native third row in
-    # the same black-bar rhythm as WEEKLY. Present only when the API reports
-    # it; guarding on scoped_pct (belt-and-suspenders with the label) keeps the
-    # no-scoped panel byte-for-byte unchanged. The ticker below is anchored to
-    # rect.bottom(), which the taller osd_height_scoped pushes down for us.
-    if data.scoped_pct is not None and data.scoped_label:
-        yy = row(yy, data.scoped_label.upper(), data.scoped_pct,
-                 f"RESETS {data.scoped_reset_hrs}H {data.scoped_reset_min}M",
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
+    if multi:
+        for acct in accounts:
+            name = (getattr(acct, "name", "") or "acct").upper()
+            yy = row(yy, f"{name} 5H", float(getattr(acct, "session_pct", 0.0) or 0.0),
+                     f"RESETS {int(getattr(acct, 'session_reset_min', 0) or 0)}M", t["accent"])
+            yy = row(yy, f"{name} 7D", float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                     f"RESETS {int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}H "
+                     f"{int(getattr(acct, 'weekly_reset_min', 0) or 0)}M",
+                     t["ink"])
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                yy = row(yy, f"{name} {acct.scoped_label.upper()}", float(acct.scoped_pct),
+                         f"RESETS {int(acct.scoped_reset_hrs)}H {int(acct.scoped_reset_min)}M",
+                         t["ink"])
+    else:
+        yy = row(yy, "SESSION", data.session_pct,
+                 f"RESETS {data.session_reset_min}M", t["accent"])
+        yy = row(yy, "WEEKLY", data.weekly_pct,
+                 f"RESETS {data.weekly_reset_hrs}H {data.weekly_reset_min}M",
                  t["ink"])
+        # Optional model-scoped weekly cap (e.g. "Fable") — a native third row in
+        # the same black-bar rhythm as WEEKLY. Present only when the API reports
+        # it; guarding on scoped_pct (belt-and-suspenders with the label) keeps the
+        # no-scoped panel byte-for-byte unchanged. The ticker below is anchored to
+        # rect.bottom(), which the taller osd_height_scoped pushes down for us.
+        if data.scoped_pct is not None and data.scoped_label:
+            yy = row(yy, data.scoped_label.upper(), data.scoped_pct,
+                     f"RESETS {data.scoped_reset_hrs}H {data.scoped_reset_min}M",
+                     t["ink"])
 
     # Optional Codex second provider — two more rows in the same black/red
     # bar rhythm (5h session mirrors SESSION's red bar, 7d mirrors WEEKLY's

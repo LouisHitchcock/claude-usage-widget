@@ -44,6 +44,16 @@ DEFAULT_CONFIG: Config = {
     # to also poll the local OpenAI Codex CLI (`codex app-server`) and show
     # its 5h/weekly rings & bars beneath Claude's. POSIX-only.
     "providers": ["claude"],
+    # Optional multi-Claude subscriptions. When 2+ entries are set, the OSD
+    # shows labeled 5h/7d rows for each account. Each entry may be a bare
+    # account name (resolved under $claude_dir/accounts/<name>.credentials.json)
+    # or an object: {"name": "personal", "credentials": "~/path/to.json"}.
+    # Empty = single-account mode unless a ClaudeCodeMultiAccounts store is found.
+    "claude_accounts": [],
+    # Path to a ClaudeCodeMultiAccounts / cc-switch store
+    # (~/.ClaudeCodeMultiAccounts.json). None = auto-detect when
+    # claude_accounts is empty; False or "" disables auto-detect.
+    "claude_accounts_store": None,
     # How often (seconds) to actually spawn the codex app-server RPC; between
     # polls the on-disk cache is served. The RPC takes a couple of seconds,
     # so keep this much larger than refresh_seconds.

@@ -1482,3 +1482,117 @@ class TestBurnDetectionWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Multi-Claude accounts
+# ---------------------------------------------------------------------------
+
+
+class TestResolveClaudeAccounts(unittest.TestCase):
+    def test_empty_config(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        self.assertEqual(_resolve_claude_accounts({}), [])
+        self.assertEqual(_resolve_claude_accounts({"claude_accounts": []}), [])
+
+    def test_bare_names(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        with tempfile.TemporaryDirectory() as d:
+            resolved = _resolve_claude_accounts({
+                "claude_dir": d,
+                "claude_accounts": ["personal", "work"],
+            })
+            self.assertEqual(len(resolved), 2)
+            self.assertEqual(resolved[0]["name"], "personal")
+            self.assertEqual(
+                resolved[0]["credentials"],
+                os.path.join(d, "accounts", "personal.credentials.json"),
+            )
+            self.assertEqual(resolved[1]["name"], "work")
+
+    def test_dict_entries_with_explicit_path(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        path = os.path.expanduser("~/creds/work.json")
+        resolved = _resolve_claude_accounts({
+            "claude_accounts": [{"name": "work", "credentials": path}],
+        })
+        self.assertEqual(resolved, [{"name": "work", "credentials": path}])
+
+    def test_skips_invalid_entries(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        resolved = _resolve_claude_accounts({
+            "claude_accounts": ["", None, 12, {"name": ""}],
+        })
+        self.assertEqual(resolved, [])
+
+
+class TestMultiClaudeCollect(unittest.TestCase):
+    def test_collect_all_populates_claude_accounts(self) -> None:
+        import claude_usage.collector as c
+
+        with tempfile.TemporaryDirectory() as d:
+            accounts_dir = os.path.join(d, "accounts")
+            os.makedirs(accounts_dir)
+            personal = os.path.join(accounts_dir, "personal.credentials.json")
+            work = os.path.join(accounts_dir, "work.credentials.json")
+            for path, sub in ((personal, "pro"), (work, "max")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "claudeAiOauth": {
+                            "accessToken": f"tok-{os.path.basename(path)}",
+                            "subscriptionType": sub,
+                        }
+                    }, fh)
+
+            def fake_from_creds(path: str):
+                if path.endswith("personal.credentials.json"):
+                    return {
+                        "session_utilization": 0.21,
+                        "session_reset": 2_000_000_000,
+                        "weekly_utilization": 0.41,
+                        "weekly_reset": 2_000_100_000,
+                        "scoped_utilization": 0.0,
+                        "scoped_reset": 0,
+                        "scoped_label": "",
+                        "overage_status": "",
+                        "fallback_status": "",
+                    }
+                return {
+                    "session_utilization": 0.55,
+                    "session_reset": 2_000_200_000,
+                    "weekly_utilization": 0.77,
+                    "weekly_reset": 2_000_300_000,
+                    "scoped_utilization": 0.12,
+                    "scoped_reset": 2_000_400_000,
+                    "scoped_label": "Fable",
+                    "overage_status": "allowed",
+                    "fallback_status": "",
+                }
+
+            cfg = {
+                "claude_dir": d,
+                "claude_accounts": ["personal", "work"],
+                "providers": ["claude"],
+                "show_news": False,
+                "burn_alerts_enabled": False,
+                "monthly_budget_usd": 0,
+            }
+            with patch.object(c, "fetch_rate_limits_from_credentials", fake_from_creds),                  patch.object(c, "fetch_rate_limits", lambda *_a, **_k: {"error": "should skip"}):
+                stats = collect_all(cfg)
+
+            self.assertEqual(len(stats.claude_accounts), 2)
+            self.assertEqual(stats.claude_accounts[0].name, "personal")
+            self.assertAlmostEqual(stats.claude_accounts[0].session_utilization, 0.21)
+            self.assertEqual(stats.claude_accounts[1].name, "work")
+            self.assertEqual(stats.claude_accounts[1].scoped_label, "Fable")
+            # Primary fields come from the first successful account.
+            self.assertAlmostEqual(stats.session_utilization, 0.21)
+            self.assertAlmostEqual(stats.weekly_utilization, 0.41)
+            self.assertEqual(stats.subscription_type, "pro")
+            self.assertEqual(stats.rate_limit_error, "")
+
+    def test_single_account_list_stays_single_mode(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        # One entry resolves, but collect_all only enables multi mode at 2+.
+        resolved = _resolve_claude_accounts({"claude_accounts": ["only"]})
+        self.assertEqual(len(resolved), 1)

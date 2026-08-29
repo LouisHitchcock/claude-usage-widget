@@ -129,61 +129,111 @@ def paint_osd(p: QPainter, rect: QRectF, data, scale: float = 1.0) -> None:
                        pct, hex_to_qcolor(t["very_dim"]),
                        hex_to_qcolor(fill_hex), radius=1.5 * s)
 
-    # session seg
+    # session / weekly segs (or multi-Claude labeled pairs stacked vertically)
     xs = x0 + title_w
-    seg(xs, mid_w, "SESSION", data.session_pct,
-        f"{data.session_reset_min}m", t["accent"])
-    p.setPen(hex_to_qcolor(t["border"]))
-    p.drawLine(QPointF(xs + mid_w, rect.y() + 4 * s),
-               QPointF(xs + mid_w, base_bottom - 4 * s))
-
-    # weekly seg
-    xw = xs + mid_w
-    seg(xw, mid_w, "WEEKLY", data.weekly_pct,
-        f"{data.weekly_reset_hrs}h", t["accent2"])
-    p.setPen(hex_to_qcolor(t["border"]))
-    p.drawLine(QPointF(xw + mid_w, rect.y() + 4 * s),
-               QPointF(xw + mid_w, base_bottom - 4 * s))
-
-    # live seg
-    xl = xw + mid_w
-    if getattr(data, "is_live", False):
-        draw_text(p, xl + 12 * s,
-                  rect.y() + 18 * s,
-                  f"● LIVE", hex_to_qcolor(t["accent"]), label_f,
-                  letter_spacing_px=1 * s)
-        draw_text(p, xl + 12 * s,
-                  rect.y() + 36 * s,
-                  f"{data.live_tok_per_min:.1f}k/min",
-                  hex_to_qcolor(t["text_primary"]), label_f)
-
-    # scoped weekly seg (e.g. "Fable") — optional third row below weekly.
-    # Only drawn when the API reported a model-scoped cap; the label guard
-    # is belt-and-suspenders so a stray pct never yields an unlabelled band.
-    scoped_pct = getattr(data, "scoped_pct", None)
-    if scoped_pct is not None and getattr(data, "scoped_label", ""):
-        # horizontal rule separating the first strip row from the scoped row,
-        # echoing the 1px vertical segment rules (border colour, 4px inset).
+    accounts = list(getattr(data, "claude_accounts", []) or [])
+    multi = len(accounts) >= 2
+    extra_top = base_bottom
+    if multi:
+        # First account uses the main strip row; extras stack below.
+        first = accounts[0]
+        name0 = (getattr(first, "name", "") or "acct").upper()
+        seg(xs, mid_w, f"{name0} 5H", float(getattr(first, "session_pct", 0.0) or 0.0),
+            f"{int(getattr(first, 'session_reset_min', 0) or 0)}m", t["accent"])
         p.setPen(hex_to_qcolor(t["border"]))
-        p.drawLine(QPointF(rect.x() + 4 * s, base_bottom),
-                   QPointF(rect.right() - 4 * s, base_bottom))
-        # Spans the session+weekly columns so the bar sits directly beneath
-        # the weekly bar, rendered with the same seg() painter, fonts and
-        # weekly accent (accent2). Reset mirrors weekly's "{hrs}h" format.
-        seg(xs, mid_w * 2, data.scoped_label.upper(), scoped_pct,
-            f"{data.scoped_reset_hrs}h", t["accent2"],
-            top=base_bottom, bh=base_h)
+        p.drawLine(QPointF(xs + mid_w, rect.y() + 4 * s),
+                   QPointF(xs + mid_w, base_bottom - 4 * s))
+        xw = xs + mid_w
+        seg(xw, mid_w, f"{name0} 7D", float(getattr(first, "weekly_pct", 0.0) or 0.0),
+            f"{int(getattr(first, 'weekly_reset_hrs', 0) or 0)}h", t["accent2"])
+        p.setPen(hex_to_qcolor(t["border"]))
+        p.drawLine(QPointF(xw + mid_w, rect.y() + 4 * s),
+                   QPointF(xw + mid_w, base_bottom - 4 * s))
+        xl = xw + mid_w
+        if getattr(data, "is_live", False):
+            draw_text(p, xl + 12 * s, rect.y() + 18 * s, "● LIVE",
+                      hex_to_qcolor(t["accent"]), label_f, letter_spacing_px=1 * s)
+            draw_text(p, xl + 12 * s, rect.y() + 36 * s,
+                      f"{data.live_tok_per_min:.1f}k/min",
+                      hex_to_qcolor(t["text_primary"]), label_f)
+        stack_top = base_bottom
+        if getattr(first, "scoped_pct", None) is not None and getattr(first, "scoped_label", ""):
+            p.setPen(hex_to_qcolor(t["border"]))
+            p.drawLine(QPointF(rect.x() + 4 * s, stack_top),
+                       QPointF(rect.right() - 4 * s, stack_top))
+            seg(xs, mid_w * 2, f"{name0} {first.scoped_label.upper()}",
+                float(first.scoped_pct), f"{int(first.scoped_reset_hrs)}h",
+                t["accent2"], top=stack_top, bh=base_h)
+            stack_top += base_h
+        for acct in accounts[1:]:
+            name = (getattr(acct, "name", "") or "acct").upper()
+            p.setPen(hex_to_qcolor(t["border"]))
+            p.drawLine(QPointF(rect.x() + 4 * s, stack_top),
+                       QPointF(rect.right() - 4 * s, stack_top))
+            seg(xs, mid_w, f"{name} 5H",
+                float(getattr(acct, "session_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'session_reset_min', 0) or 0)}m",
+                t["accent"], top=stack_top, bh=base_h)
+            seg(xs + mid_w, mid_w, f"{name} 7D",
+                float(getattr(acct, "weekly_pct", 0.0) or 0.0),
+                f"{int(getattr(acct, 'weekly_reset_hrs', 0) or 0)}h",
+                t["accent2"], top=stack_top, bh=base_h)
+            stack_top += base_h
+            if getattr(acct, "scoped_pct", None) is not None and getattr(acct, "scoped_label", ""):
+                p.setPen(hex_to_qcolor(t["border"]))
+                p.drawLine(QPointF(rect.x() + 4 * s, stack_top),
+                           QPointF(rect.right() - 4 * s, stack_top))
+                seg(xs, mid_w * 2, f"{name} {acct.scoped_label.upper()}",
+                    float(acct.scoped_pct), f"{int(acct.scoped_reset_hrs)}h",
+                    t["accent2"], top=stack_top, bh=base_h)
+                stack_top += base_h
+        extra_top = stack_top
+        scoped_pct = None  # already folded into stacked rows
+    else:
+        seg(xs, mid_w, "SESSION", data.session_pct,
+            f"{data.session_reset_min}m", t["accent"])
+        p.setPen(hex_to_qcolor(t["border"]))
+        p.drawLine(QPointF(xs + mid_w, rect.y() + 4 * s),
+                   QPointF(xs + mid_w, base_bottom - 4 * s))
+
+        # weekly seg
+        xw = xs + mid_w
+        seg(xw, mid_w, "WEEKLY", data.weekly_pct,
+            f"{data.weekly_reset_hrs}h", t["accent2"])
+        p.setPen(hex_to_qcolor(t["border"]))
+        p.drawLine(QPointF(xw + mid_w, rect.y() + 4 * s),
+                   QPointF(xw + mid_w, base_bottom - 4 * s))
+
+        # live seg
+        xl = xw + mid_w
+        if getattr(data, "is_live", False):
+            draw_text(p, xl + 12 * s,
+                      rect.y() + 18 * s,
+                      f"● LIVE", hex_to_qcolor(t["accent"]), label_f,
+                      letter_spacing_px=1 * s)
+            draw_text(p, xl + 12 * s,
+                      rect.y() + 36 * s,
+                      f"{data.live_tok_per_min:.1f}k/min",
+                      hex_to_qcolor(t["text_primary"]), label_f)
+
+        # scoped weekly seg (e.g. "Fable") — optional third row below weekly.
+        scoped_pct = getattr(data, "scoped_pct", None)
+        if scoped_pct is not None and getattr(data, "scoped_label", ""):
+            p.setPen(hex_to_qcolor(t["border"]))
+            p.drawLine(QPointF(rect.x() + 4 * s, base_bottom),
+                       QPointF(rect.right() - 4 * s, base_bottom))
+            seg(xs, mid_w * 2, data.scoped_label.upper(), scoped_pct,
+                f"{data.scoped_reset_hrs}h", t["accent2"],
+                top=base_bottom, bh=base_h)
+            extra_top = base_bottom + base_h
 
     # optional Codex second-provider rows — two stacked bands mirroring the
     # SESSION (5h) and WEEKLY (7d) rows in this skin's style. Drawn AFTER the
-    # scoped row so the running vertical cursor flows Session → Weekly →
+    # scoped/multi rows so the running vertical cursor flows Session → Weekly →
     # [scoped] → Codex 5h → Codex 7d. Nothing is painted when the provider
     # is absent, keeping the byte-identical default intact.
     if getattr(data, "codex_available", False):
-        # start below the first strip row, plus the scoped row if it drew one
-        codex_top = base_bottom
-        if scoped_pct is not None and getattr(data, "scoped_label", ""):
-            codex_top = base_bottom + base_h
+        codex_top = extra_top
         # Codex 5h — mirrors SESSION (accent, "{min}m" reset)
         p.setPen(hex_to_qcolor(t["border"]))
         p.drawLine(QPointF(rect.x() + 4 * s, codex_top),
