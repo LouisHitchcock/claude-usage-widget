@@ -71,6 +71,12 @@ class ClaudeAccountStats:
     scoped_reset: int = 0
     scoped_label: str = ""
     error: str = ""
+    # Stable identity fields used by the detail popup nickname editor so a
+    # rename survives label changes (email / org preferred over display name).
+    email: str = ""
+    organization_name: str = ""
+    store_key: str = ""
+    credentials_path: str = ""
 
 
 @dataclass
@@ -1227,6 +1233,11 @@ def _account_stats_from_rate_limits(
     name: str,
     subscription_type: str,
     rate_limits: dict[str, Any],
+    *,
+    email: str = "",
+    organization_name: str = "",
+    store_key: str = "",
+    credentials_path: str = "",
 ) -> ClaudeAccountStats:
     """Map a ``fetch_rate_limits`` result onto :class:`ClaudeAccountStats`."""
     # Snapshot fallbacks may carry both numbers and a soft error/rate_limited
@@ -1235,11 +1246,18 @@ def _account_stats_from_rate_limits(
         k in rate_limits
         for k in ("session_utilization", "weekly_utilization", "from_usage_snapshot")
     )
+    identity = {
+        "email": str(email or ""),
+        "organization_name": str(organization_name or ""),
+        "store_key": str(store_key or ""),
+        "credentials_path": str(credentials_path or ""),
+    }
     if "error" in rate_limits and not has_usage_fields:
         return ClaudeAccountStats(
             name=name,
             subscription_type=subscription_type,
             error=str(rate_limits.get("error") or "error"),
+            **identity,
         )
     return ClaudeAccountStats(
         name=name,
@@ -1252,6 +1270,7 @@ def _account_stats_from_rate_limits(
         scoped_reset=int(rate_limits.get("scoped_reset", 0) or 0),
         scoped_label=str(rate_limits.get("scoped_label", "") or ""),
         error=str(rate_limits.get("error") or "") if has_usage_fields and rate_limits.get("error") else "",
+        **identity,
     )
 
 
@@ -1995,7 +2014,13 @@ def collect_all(config: dict[str, Any]) -> UsageStats:
                 acct_limits = fetch_rate_limits_from_account_spec(spec)
             except Exception as exc:
                 acct_limits = {"error": f"fetch failed: {exc}"}
-            acct = _account_stats_from_rate_limits(name, sub, acct_limits)
+            acct = _account_stats_from_rate_limits(
+                name, sub, acct_limits,
+                email=str(spec.get("email") or ""),
+                organization_name=str(spec.get("organization_name") or ""),
+                store_key=str(spec.get("store_key") or ""),
+                credentials_path=path,
+            )
             accounts.append(acct)
             if not primary_applied and not acct.error:
                 _apply_rate_limits_to_stats(stats, acct_limits)

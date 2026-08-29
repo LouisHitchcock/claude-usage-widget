@@ -293,7 +293,11 @@ Aliases: `ccs` = `cc-switch`, `ccso` = `cc-sync-oauth`.
 
 ### Nicknames / rename accounts
 
-Default labels prefer org/plan over profile names (so two accounts both named "Louis" become **Pro** and **DroneTech** instead of Louis / Louis-2). Override any label with nicknames:
+Default labels prefer org/plan over profile names (so two accounts both named "Louis" become **Pro** and **DroneTech** instead of Louis / Louis-2).
+
+**In the detail popup (left-click the OSD):** when 2+ accounts are active, an **Account nicknames** section appears with a text field per account and a **Save nicknames** button. Changes apply to the OSD immediately and persist to `~/.config/claude-usage/config.json`.
+
+You can also set nicknames by hand:
 
 ```json
 {

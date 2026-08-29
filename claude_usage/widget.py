@@ -28,8 +28,11 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -328,6 +331,10 @@ class SkinPopupWidget(QWidget):
     # as a bare grey strip beside the scrollbar.
     _SCROLLBAR_W = 10
 
+    # Emitted when the user renames multi-Claude accounts from the skin popup.
+    # Payload is a full nicknames map (email/org/key -> label).
+    nicknamesChanged = Signal(object)
+
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
         from claude_usage.skins import SKIN_MODULES
@@ -335,6 +342,7 @@ class SkinPopupWidget(QWidget):
         self._all_skins = SKIN_MODULES
         self._skin = SKIN_MODULES.get(str(config.get("theme", "")))
         self._data = None
+        self._stats: UsageStats | None = None
         self._scale = 1.0
         # Phase driver for the pre-data "Loading..." animation. Bumps every
         # tick so dots cycle / arcs sweep while we wait for first collect.
@@ -361,9 +369,20 @@ class SkinPopupWidget(QWidget):
         self._scroll.setFrameShape(QScrollArea.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        # Nickname editor strip sits under the painted skin content so users
+        # can rename accounts without editing config.json by hand.
+        self._nick_panel = QWidget(self)
+        self._nick_panel.setObjectName("skinNickPanel")
+        self._nick_layout = QVBoxLayout(self._nick_panel)
+        self._nick_layout.setContentsMargins(12, 8, 12, 10)
+        self._nick_layout.setSpacing(6)
+        self._nick_panel.setVisible(False)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(self._scroll)
+        root.setSpacing(0)
+        root.addWidget(self._scroll, 1)
+        root.addWidget(self._nick_panel, 0)
 
         self._apply_scrollbar_style()
         self.resize(540, 360)
@@ -398,13 +417,105 @@ class SkinPopupWidget(QWidget):
         """Project the latest UsageStats into the skin's popup-data shape
         and trigger a repaint."""
         from claude_usage.skins._adapter import build_popup_data
+        self._stats = stats
         self._data = build_popup_data(stats)
         # First-data-in: stop the loading animation and repaint immediately
         # so the placeholder doesn't linger for another timer interval.
         if self._loading_timer.isActive():
             self._loading_timer.stop()
+        self._rebuild_nickname_panel(stats)
         self._resize_content()
         self._content.update()
+
+    def _rebuild_nickname_panel(self, stats: UsageStats) -> None:
+        """Show editable nickname rows when multi-account mode is active."""
+        while self._nick_layout.count():
+            item = self._nick_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        accounts = list(getattr(stats, "claude_accounts", []) or [])
+        if len(accounts) < 2:
+            self._nick_panel.setVisible(False)
+            return
+
+        t = (self._skin.THEME if self._skin is not None else {}) or {}
+        bg = t.get("panel", t.get("bg", "#1a1a2e"))
+        text = t.get("text_primary", "#e0e0e8")
+        dim = t.get("text_dim", "#8a8a9a")
+        border = t.get("border", t.get("separator", "#2a2a38"))
+        accent = t.get("accent", t.get("bar_blue", "#5B9BD5"))
+        self._nick_panel.setStyleSheet(
+            f"QWidget#skinNickPanel {{ background: {bg}; border-top: 1px solid {border}; }}"
+            f"QLabel {{ color: {text}; background: transparent; }}"
+            f"QLineEdit {{ background: {bg}; color: {text}; border: 1px solid {border}; "
+            f"padding: 4px 8px; border-radius: 4px; }}"
+            f"QPushButton {{ background: {accent}; color: {bg}; border: none; "
+            f"padding: 5px 12px; border-radius: 4px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {text}; color: {bg}; }}"
+        )
+
+        title = QLabel("Account nicknames")
+        title.setStyleSheet(f"color: {text}; font-weight: bold;")
+        self._nick_layout.addWidget(title)
+        hint = QLabel("Shown on the OSD. Leave blank to use the default label.")
+        hint.setStyleSheet(f"color: {dim}; font-size: 11px;")
+        hint.setWordWrap(True)
+        self._nick_layout.addWidget(hint)
+
+        self._nick_edits: list[tuple[Any, QLineEdit]] = []
+        for acct in accounts:
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(8)
+            sub = (getattr(acct, "email", "") or getattr(acct, "organization_name", "")
+                   or getattr(acct, "subscription_type", "") or "").strip()
+            left = QLabel(sub or getattr(acct, "name", "account"))
+            left.setMinimumWidth(140)
+            left.setStyleSheet(f"color: {dim}; font-size: 11px;")
+            edit = QLineEdit(str(getattr(acct, "name", "") or ""))
+            edit.setPlaceholderText("Nickname")
+            edit.setMaxLength(24)
+            hl.addWidget(left, 1)
+            hl.addWidget(edit, 2)
+            self._nick_layout.addWidget(row)
+            self._nick_edits.append((acct, edit))
+
+        save_btn = QPushButton("Save nicknames")
+        save_btn.clicked.connect(self._on_save_nicknames)
+        self._nick_layout.addWidget(save_btn, 0, Qt.AlignRight)
+        self._nick_panel.setVisible(True)
+
+    def _on_save_nicknames(self) -> None:
+        edits = getattr(self, "_nick_edits", None) or []
+        if not edits:
+            return
+        nicknames = dict(self._config.get("claude_account_nicknames") or {})
+        if not isinstance(nicknames, dict):
+            nicknames = {}
+        for acct, edit in edits:
+            label = edit.text().strip()[:24]
+            key = _nickname_identity_key(acct)
+            if not key:
+                continue
+            if label:
+                nicknames[key] = label
+            else:
+                nicknames.pop(key, None)
+                # Also clear common alternate keys so stale map entries don't
+                # keep winning after a blank-out.
+                for alt in (
+                    str(getattr(acct, "email", "") or ""),
+                    str(getattr(acct, "organization_name", "") or ""),
+                    str(getattr(acct, "store_key", "") or ""),
+                    str(getattr(acct, "name", "") or ""),
+                ):
+                    if alt:
+                        nicknames.pop(alt, None)
+                        nicknames.pop(alt.lower(), None)
+        self.nicknamesChanged.emit(nicknames)
 
     def _tick_loading(self) -> None:
         if self._data is not None:
@@ -516,8 +627,20 @@ class _Barcode(QWidget):
 # Detail popup
 # ---------------------------------------------------------------------------
 
+def _nickname_identity_key(acct: Any) -> str:
+    """Stable config key for an account nickname (email > org > store key)."""
+    for attr in ("email", "organization_name", "store_key", "credentials_path", "name"):
+        val = str(getattr(acct, attr, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
 class UsagePopup(QWidget):
     """Scrollable detail window showing all :class:`UsageStats` fields."""
+
+    # Emitted when the user saves multi-Claude account nicknames from the popup.
+    nicknamesChanged = Signal(object)
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
@@ -584,6 +707,23 @@ class UsagePopup(QWidget):
             QLabel[role="pct"]    {{ font-size: 12px; color: {t['text_secondary']}; }}
             QLabel[role="link"]   {{ font-size: 11px; color: {t['text_link']}; }}
             QLabel[role="error"]  {{ font-size: 11px; color: {t['error']}; }}
+            QLineEdit {{
+                background-color: {t['bg']};
+                color: {t['text_primary']};
+                border: 1px solid {t['separator']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                selection-background-color: {t['bar_blue']};
+            }}
+            QPushButton {{
+                background-color: {t['bar_blue']};
+                color: {t['bg']};
+                border: none;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: {t['text_primary']}; }}
         """
 
     # -------------------------------------------------------------- helpers
@@ -734,40 +874,82 @@ class UsagePopup(QWidget):
     def _rebuild_from(self, stats: UsageStats) -> None:
         self._clear_layout()
 
-        # --- Plan usage limits ---
-        self._add_section_header("Plan usage limits")
-        self._add_usage_row(
-            "Current session",
-            _format_reset_duration(stats.session_reset),
-            stats.session_utilization,
-        )
-        s_fc = format_forecast(stats.session_forecast)
-        if s_fc:
-            self._add_dim_line(s_fc)
-        if getattr(stats, "in_peak_window", False) and getattr(stats, "peak_hint", ""):
-            self._add_dim_line(f"⏱ {stats.peak_hint}")
-        self._add_sparkline(stats.session_history, "Last 5 hours")
-        self._add_separator()
+        accounts = list(getattr(stats, "claude_accounts", []) or [])
+        multi = len(accounts) >= 2
 
-        # --- Weekly limits ---
-        self._add_section_header("Weekly limits")
-        self._add_usage_row(
-            "All models",
-            _format_reset_day(stats.weekly_reset),
-            stats.weekly_utilization,
-        )
-        # Optional model-scoped weekly cap (e.g. Fable) — only when the API
-        # reports it (temporary limit; auto-hides when it goes away).
-        if getattr(stats, "scoped_label", ""):
+        if multi:
+            # --- Multi-Claude accounts ---
+            self._add_section_header("Claude accounts", f"{len(accounts)} active")
+            for acct in accounts:
+                label = str(getattr(acct, "name", "") or "account")
+                sub_bits = []
+                email = str(getattr(acct, "email", "") or "").strip()
+                org = str(getattr(acct, "organization_name", "") or "").strip()
+                plan = str(getattr(acct, "subscription_type", "") or "").strip()
+                if email:
+                    sub_bits.append(email)
+                elif org and "'s Organization" not in org:
+                    sub_bits.append(org)
+                if plan:
+                    sub_bits.append(plan)
+                err = str(getattr(acct, "error", "") or "").strip()
+                subtitle = " · ".join(sub_bits)
+                if err and not getattr(acct, "session_utilization", 0) and not getattr(acct, "weekly_utilization", 0):
+                    subtitle = (subtitle + " · " if subtitle else "") + err
+                self._add_usage_row(
+                    f"{label} 5h",
+                    subtitle or _format_reset_duration(int(getattr(acct, "session_reset", 0) or 0)),
+                    float(getattr(acct, "session_utilization", 0.0) or 0.0),
+                )
+                self._add_usage_row(
+                    f"{label} 7d",
+                    _format_reset_day(int(getattr(acct, "weekly_reset", 0) or 0)),
+                    float(getattr(acct, "weekly_utilization", 0.0) or 0.0),
+                )
+                scoped_label = str(getattr(acct, "scoped_label", "") or "")
+                if scoped_label:
+                    self._add_usage_row(
+                        f"{label} {scoped_label}",
+                        _format_reset_day(int(getattr(acct, "scoped_reset", 0) or 0)),
+                        float(getattr(acct, "scoped_utilization", 0.0) or 0.0),
+                    )
+            self._render_account_nicknames(accounts)
+            self._add_separator()
+        else:
+            # --- Plan usage limits ---
+            self._add_section_header("Plan usage limits")
             self._add_usage_row(
-                stats.scoped_label,
-                _format_reset_day(stats.scoped_reset),
-                stats.scoped_utilization,
+                "Current session",
+                _format_reset_duration(stats.session_reset),
+                stats.session_utilization,
             )
-        w_fc = format_forecast(stats.weekly_forecast)
-        if w_fc:
-            self._add_dim_line(w_fc)
-        self._add_sparkline(stats.weekly_history, "Last 7 days")
+            s_fc = format_forecast(stats.session_forecast)
+            if s_fc:
+                self._add_dim_line(s_fc)
+            if getattr(stats, "in_peak_window", False) and getattr(stats, "peak_hint", ""):
+                self._add_dim_line(f"⏱ {stats.peak_hint}")
+            self._add_sparkline(stats.session_history, "Last 5 hours")
+            self._add_separator()
+
+            # --- Weekly limits ---
+            self._add_section_header("Weekly limits")
+            self._add_usage_row(
+                "All models",
+                _format_reset_day(stats.weekly_reset),
+                stats.weekly_utilization,
+            )
+            # Optional model-scoped weekly cap (e.g. Fable) — only when the API
+            # reports it (temporary limit; auto-hides when it goes away).
+            if getattr(stats, "scoped_label", ""):
+                self._add_usage_row(
+                    stats.scoped_label,
+                    _format_reset_day(stats.scoped_reset),
+                    stats.scoped_utilization,
+                )
+            w_fc = format_forecast(stats.weekly_forecast)
+            if w_fc:
+                self._add_dim_line(w_fc)
+            self._add_sparkline(stats.weekly_history, "Last 7 days")
 
         # 90-day heatmap
         heatmap = getattr(stats, "daily_heatmap", []) or []
@@ -814,6 +996,74 @@ class UsagePopup(QWidget):
         self._render_footer(stats)
 
     # ------------------------------------------------------------ sections
+
+    def _render_account_nicknames(self, accounts: list) -> None:
+        """Editable nickname fields for multi-Claude OSD labels."""
+        self._add_section_header("Account nicknames")
+        self._add_dim_line(
+            "Rename the labels shown on the OSD. Leave blank to reset.",
+            margin_bottom=8,
+        )
+        self._nick_edits: list[tuple[Any, QLineEdit]] = []
+        for acct in accounts:
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 8)
+            hl.setSpacing(10)
+
+            identity = (
+                str(getattr(acct, "email", "") or "").strip()
+                or str(getattr(acct, "organization_name", "") or "").strip()
+                or str(getattr(acct, "subscription_type", "") or "").strip()
+                or str(getattr(acct, "name", "") or "account")
+            )
+            left = self._label(identity, "sub")
+            left.setMinimumWidth(160)
+            left.setWordWrap(True)
+            edit = QLineEdit(str(getattr(acct, "name", "") or ""))
+            edit.setPlaceholderText("Nickname")
+            edit.setMaxLength(24)
+            edit.setClearButtonEnabled(True)
+            hl.addWidget(left, 1)
+            hl.addWidget(edit, 2)
+            self._layout.addWidget(row)
+            self._nick_edits.append((acct, edit))
+
+        save_row = QWidget()
+        save_hl = QHBoxLayout(save_row)
+        save_hl.setContentsMargins(0, 0, 0, 4)
+        save_hl.addStretch(1)
+        save_btn = QPushButton("Save nicknames")
+        save_btn.clicked.connect(self._on_save_nicknames)
+        save_hl.addWidget(save_btn)
+        self._layout.addWidget(save_row)
+
+    def _on_save_nicknames(self) -> None:
+        edits = getattr(self, "_nick_edits", None) or []
+        if not edits:
+            return
+        nicknames = dict(self._config.get("claude_account_nicknames") or {})
+        if not isinstance(nicknames, dict):
+            nicknames = {}
+        for acct, edit in edits:
+            label = edit.text().strip()[:24]
+            key = _nickname_identity_key(acct)
+            if not key:
+                continue
+            if label:
+                nicknames[key] = label
+            else:
+                nicknames.pop(key, None)
+                for alt in (
+                    str(getattr(acct, "email", "") or ""),
+                    str(getattr(acct, "organization_name", "") or ""),
+                    str(getattr(acct, "store_key", "") or ""),
+                    str(getattr(acct, "name", "") or ""),
+                ):
+                    if alt:
+                        nicknames.pop(alt, None)
+                        nicknames.pop(alt.lower(), None)
+        self.nicknamesChanged.emit(nicknames)
 
     def _render_cost_section(self, stats: UsageStats) -> None:
         today_cost = float(getattr(stats, "today_cost", 0.0) or 0.0)
@@ -1092,6 +1342,8 @@ class ClaudeUsageApp(QObject):
         self.overlay.movedTo.connect(self._on_overlay_moved)
         self.overlay.scaledTo.connect(self._on_overlay_scaled)
         self.overlay.minimizedChanged.connect(self._on_overlay_minimized_changed)
+        self.popup.nicknamesChanged.connect(self._on_nicknames_changed)
+        self.skin_popup.nicknamesChanged.connect(self._on_nicknames_changed)
         self.stats_ready.connect(self._apply_stats)
         self.update_available.connect(self._on_update_available)
 
@@ -1307,6 +1559,23 @@ class ClaudeUsageApp(QObject):
         self.overlay.set_always_on_top(checked)
         self.config["osd_always_on_top"] = bool(checked)
         self._persist_config()
+
+    def _on_nicknames_changed(self, nicknames: object) -> None:
+        """Persist account nicknames from the detail popup and refresh ASAP."""
+        if not isinstance(nicknames, dict):
+            return
+        cleaned: dict[str, str] = {}
+        for key, val in nicknames.items():
+            k = str(key or "").strip()
+            v = str(val or "").strip()[:24]
+            if k and v:
+                cleaned[k] = v
+        self.config["claude_account_nicknames"] = cleaned
+        # Keep both popup implementations in sync with the live config dict.
+        self.popup.apply_config(self.config)
+        self.skin_popup.apply_config(self.config)
+        self._persist_config()
+        self._refresh_async()
 
     def _on_pick_theme(self, name: str) -> None:
         # If either popup is open, close it — switching themes swaps the
