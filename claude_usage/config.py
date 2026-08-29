@@ -47,13 +47,19 @@ DEFAULT_CONFIG: Config = {
     # Optional multi-Claude subscriptions. When 2+ entries are set, the OSD
     # shows labeled 5h/7d rows for each account. Each entry may be a bare
     # account name (resolved under $claude_dir/accounts/<name>.credentials.json)
-    # or an object: {"name": "personal", "credentials": "~/path/to.json"}.
-    # Empty = single-account mode unless a ClaudeCodeMultiAccounts store is found.
+    # or an object: {"name": "personal", "credentials": "~/path/to.json",
+    # "nickname": "Home"}. Empty = single-account mode unless a
+    # ClaudeCodeMultiAccounts store is found.
     "claude_accounts": [],
     # Path to a ClaudeCodeMultiAccounts / cc-switch store
     # (~/.ClaudeCodeMultiAccounts.json). None = auto-detect when
     # claude_accounts is empty; False or "" disables auto-detect.
     "claude_accounts_store": None,
+    # Optional nicknames for auto-detected multi-account store rows. Keys may
+    # be email, organization name, subscription type (pro/team), store key, or
+    # the default label. Values are short OSD labels, e.g.
+    # {"louishitchcock@gmail.com": "Personal", "DroneTech": "Work"}.
+    "claude_account_nicknames": {},
     # How often (seconds) to actually spawn the codex app-server RPC; between
     # polls the on-disk cache is served. The RPC takes a couple of seconds,
     # so keep this much larger than refresh_seconds.

@@ -819,25 +819,163 @@ def _default_multi_accounts_store_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".ClaudeCodeMultiAccounts.json")
 
 
-def _account_display_name(metadata: dict[str, Any], fallback: str = "account") -> str:
-    """Pick a short OSD label from a multi-account store metadata block."""
-    for key in ("alias", "displayName", "fullName", "emailAddress", "organizationName"):
-        val = str(metadata.get(key) or "").strip()
+def _short_osd_label(value: str, *, email: bool = False) -> str:
+    """Trim a label to the OSD-friendly width."""
+    val = str(value or "").strip()
+    if not val:
+        return ""
+    if email and "@" in val:
+        val = val.split("@", 1)[0]
+    return val[:24]
+
+
+def _account_display_name(
+    metadata: dict[str, Any],
+    *,
+    subscription_type: str = "",
+    fallback: str = "account",
+) -> str:
+    """Pick a short OSD label from a multi-account store metadata block.
+
+    Prefer organization / plan labels over generic profile display names
+    (``Louis``) so two people-named accounts stay distinguishable.
+    """
+    # Explicit nickname/alias first when present in store metadata.
+    for key in ("alias", "nickname", "nick"):
+        val = _short_osd_label(str(metadata.get(key) or ""))
         if val:
-            # Email -> local part; keep short for OSD row labels.
-            if "@" in val and key == "emailAddress":
-                val = val.split("@", 1)[0]
-            return val[:24]
-    org = str(metadata.get("organizationType") or "").strip()
-    if org:
-        return org.replace("claude_", "")[:24]
+            return val
+
+    org_name = str(metadata.get("organizationName") or "").strip()
+    if org_name and "'s Organization" not in org_name:
+        # Real org names ("DroneTech") beat auto-generated personal orgs.
+        return _short_osd_label(org_name)
+
+    seat = str(metadata.get("seatTier") or "").strip()
+    if seat:
+        # team_standard -> Team Std style labels
+        pretty = seat.replace("_", " ").title().replace(" Team", "").strip()
+        if pretty:
+            return _short_osd_label(pretty)
+
+    org_type = str(metadata.get("organizationType") or subscription_type or "").strip()
+    if org_type:
+        return _short_osd_label(org_type.replace("claude_", "").title())
+
+    email = _short_osd_label(str(metadata.get("emailAddress") or ""), email=True)
+    if email:
+        return email
+
+    for key in ("displayName", "fullName"):
+        val = _short_osd_label(str(metadata.get(key) or ""))
+        if val:
+            return val
+
+    if org_name:
+        return _short_osd_label(org_name)
     return fallback
 
 
-def _resolve_accounts_from_multi_store(store_path: str) -> list[dict[str, Any]]:
+def _nickname_lookup_map(config: dict[str, Any] | None) -> dict[str, str]:
+    """Normalize ``claude_account_nicknames`` keys to lowercase."""
+    raw = (config or {}).get("claude_account_nicknames") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, val in raw.items():
+        k = str(key or "").strip().lower()
+        v = _short_osd_label(str(val or ""))
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _apply_account_nickname(
+    name: str,
+    *,
+    nicknames: dict[str, str],
+    match_keys: list[str] | None = None,
+) -> str:
+    """Override *name* when any match key hits the nickname map."""
+    if not nicknames:
+        return name
+    candidates = [name] + list(match_keys or [])
+    for cand in candidates:
+        key = str(cand or "").strip().lower()
+        if key and key in nicknames:
+            return nicknames[key]
+    return name
+
+
+def _usage_snapshot_to_rate_limits(snapshot: Any) -> dict[str, Any] | None:
+    """Convert a ClaudeCodeMultiAccounts ``usageSnapshot`` into rate-limit fields."""
+    if not isinstance(snapshot, dict):
+        return None
+    five = snapshot.get("five_hour") if isinstance(snapshot.get("five_hour"), dict) else {}
+    seven = snapshot.get("seven_day") if isinstance(snapshot.get("seven_day"), dict) else {}
+    if not five and not seven:
+        return None
+
+    def _pct_to_frac(v: Any) -> float:
+        try:
+            f = float(v) / 100.0
+        except (TypeError, ValueError):
+            return 0.0
+        if math.isnan(f) or math.isinf(f):
+            return 0.0
+        return max(0.0, min(f, 1.0))
+
+    def _iso_to_epoch(v: Any) -> int:
+        if v is None or v == "":
+            return 0
+        if isinstance(v, (int, float)):
+            ts = int(v)
+            # ms -> s guard (same threshold as header parser).
+            if ts > 4_102_444_800:
+                ts //= 1000
+            return max(0, ts)
+        if not isinstance(v, str):
+            return 0
+        s = v.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except (ValueError, TypeError):
+            return 0
+
+    now_ts = time.time()
+    session_util = _pct_to_frac(five.get("utilization", 0))
+    session_reset = _iso_to_epoch(five.get("resets_at"))
+    weekly_util = _pct_to_frac(seven.get("utilization", 0))
+    weekly_reset = _iso_to_epoch(seven.get("resets_at"))
+    if session_reset and now_ts >= session_reset:
+        session_util, session_reset = 0.0, 0
+    if weekly_reset and now_ts >= weekly_reset:
+        weekly_util, weekly_reset = 0.0, 0
+
+    return {
+        "session_utilization": session_util,
+        "session_reset": session_reset,
+        "weekly_utilization": weekly_util,
+        "weekly_reset": weekly_reset,
+        "scoped_utilization": 0.0,
+        "scoped_reset": 0,
+        "scoped_label": "",
+        "overage_status": "",
+        "fallback_status": "",
+        "from_usage_snapshot": True,
+    }
+
+
+def _resolve_accounts_from_multi_store(
+    store_path: str,
+    *,
+    nicknames: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Load account rows from a ClaudeCodeMultiAccounts JSON store.
 
-    Each row is ``{name, store_path, store_key, credentials_obj}`` where
+    Each row is ``{name, store_path, store_key, credentials_obj, ...}`` where
     ``credentials_obj`` is the embedded credentials dict (same shape as
     ``.credentials.json``). Tokens are refreshed in-place in the store file.
     """
@@ -853,6 +991,7 @@ def _resolve_accounts_from_multi_store(store_path: str) -> list[dict[str, Any]]:
     if not isinstance(accounts, list):
         return []
 
+    nick_map = nicknames or {}
     resolved: list[dict[str, Any]] = []
     used_names: set[str] = set()
     for idx, entry in enumerate(accounts):
@@ -863,24 +1002,42 @@ def _resolve_accounts_from_multi_store(store_path: str) -> list[dict[str, Any]]:
             continue
         meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
         key = str(entry.get("key") or f"idx:{idx}")
-        base = _account_display_name(meta, fallback=f"acct{idx}")
+        sub = str(
+            (creds.get("claudeAiOauth") or {}).get("subscriptionType")
+            or meta.get("organizationType")
+            or ""
+        ).replace("claude_", "")
+        base = _account_display_name(meta, subscription_type=sub, fallback=f"acct{idx}")
+        match_keys = [
+            str(meta.get("emailAddress") or ""),
+            str(meta.get("organizationName") or ""),
+            str(meta.get("organizationType") or "").replace("claude_", ""),
+            str(meta.get("seatTier") or ""),
+            str(meta.get("accountUuid") or ""),
+            sub,
+            key,
+            base,
+        ]
+        base = _apply_account_nickname(base, nicknames=nick_map, match_keys=match_keys)
         name = base
         n = 2
         while name.lower() in used_names:
             name = f"{base}-{n}"
             n += 1
         used_names.add(name.lower())
-        resolved.append({
+        row: dict[str, Any] = {
             "name": name,
             "store_path": store_path,
             "store_key": key,
             "credentials_obj": creds,
-            "subscription_type": str(
-                (creds.get("claudeAiOauth") or {}).get("subscriptionType")
-                or meta.get("organizationType")
-                or ""
-            ).replace("claude_", ""),
-        })
+            "subscription_type": sub,
+            "email": str(meta.get("emailAddress") or ""),
+            "organization_name": str(meta.get("organizationName") or ""),
+        }
+        snap = _usage_snapshot_to_rate_limits(entry.get("usageSnapshot"))
+        if snap is not None:
+            row["usage_snapshot"] = snap
+        resolved.append(row)
     return resolved
 
 
@@ -891,7 +1048,7 @@ def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
 
     1. Explicit ``claude_accounts`` list — bare names map to
        ``$claude_dir/accounts/<name>.credentials.json``, or objects with
-       ``{"name", "credentials"}`` paths.
+       ``{"name", "credentials", "nickname"}`` paths.
     2. ``claude_accounts_store`` path (default
        ``~/.ClaudeCodeMultiAccounts.json`` when the file exists and
        ``claude_accounts`` is empty) — the ClaudeCodeMultiAccounts /
@@ -899,6 +1056,7 @@ def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
 
     Returns an empty list when multi-account mode is not configured.
     """
+    nick_map = _nickname_lookup_map(config)
     raw = config.get("claude_accounts") or []
     if isinstance(raw, list) and raw:
         claude_dir = str(config.get("claude_dir") or os.path.expanduser("~/.claude"))
@@ -909,9 +1067,13 @@ def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
                 if not name:
                     continue
                 path = os.path.join(claude_dir, "accounts", f"{name}.credentials.json")
+                nickname = ""
             elif isinstance(entry, dict):
                 name = str(entry.get("name") or "").strip()
                 path = str(entry.get("credentials") or entry.get("path") or "").strip()
+                nickname = str(
+                    entry.get("nickname") or entry.get("alias") or entry.get("label") or ""
+                ).strip()
                 if not name and path:
                     base = os.path.basename(path)
                     name = base.replace(".credentials.json", "").replace(".json", "") or "account"
@@ -922,7 +1084,13 @@ def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
                 path = os.path.expanduser(path)
             else:
                 continue
-            resolved.append({"name": name, "credentials": path})
+            label = _short_osd_label(nickname) if nickname else name
+            label = _apply_account_nickname(
+                label,
+                nicknames=nick_map,
+                match_keys=[name, path, os.path.basename(path)],
+            )
+            resolved.append({"name": label, "credentials": path})
         return resolved
 
     # Auto multi-account store (cc-switch) when present and not disabled.
@@ -935,7 +1103,7 @@ def _resolve_claude_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
             return []
     else:
         store_path = os.path.expanduser(str(store_cfg))
-    return _resolve_accounts_from_multi_store(store_path)
+    return _resolve_accounts_from_multi_store(store_path, nicknames=nick_map)
 
 
 def _ensure_fresh_oauth_in_store(store_path: str, store_key: str, credentials_obj: dict[str, Any]) -> str | None:
@@ -1003,10 +1171,19 @@ def _ensure_fresh_oauth_in_store(store_path: str, store_key: str, credentials_ob
 
 def fetch_rate_limits_from_account_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Fetch plan utilisation for one resolved multi-account row."""
+    snap = spec.get("usage_snapshot") if isinstance(spec.get("usage_snapshot"), dict) else None
+
     # Path-based snapshots (legacy ~/.claude/accounts/*.json).
     path = str(spec.get("credentials") or "").strip()
     if path:
-        return fetch_rate_limits_from_credentials(path)
+        result = fetch_rate_limits_from_credentials(path)
+        if "error" in result and snap is not None and result.get("rate_limited"):
+            # Keep last-known store snapshot rather than blanking the OSD.
+            out = dict(snap)
+            out["rate_limited"] = True
+            out["error"] = str(result.get("error") or "Rate limited -- using last known values")
+            return out
+        return result
 
     # ClaudeCodeMultiAccounts store entry with embedded credentials.
     store_path = str(spec.get("store_path") or "").strip()
@@ -1015,10 +1192,34 @@ def fetch_rate_limits_from_account_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if store_path and store_key and isinstance(creds_obj, dict):
         token = _ensure_fresh_oauth_in_store(store_path, store_key, creds_obj)
         if not token:
+            if snap is not None:
+                out = dict(snap)
+                out["error"] = (
+                    f"No valid credentials for store account {spec.get('name')!r} "
+                    f"-- run cc-sync-oauth after logging in"
+                )
+                return out
             return {"error": f"No valid credentials for store account {spec.get('name')!r} "
                              f"-- run cc-sync-oauth after logging in"}
-        return fetch_rate_limits_for_token(token)
+        result = fetch_rate_limits_for_token(token)
+        if "error" in result and snap is not None:
+            # API throttle / transient failure: serve cc-switch usageSnapshot.
+            out = dict(snap)
+            if result.get("rate_limited"):
+                out["rate_limited"] = True
+            out["error"] = str(result.get("error") or "using last known values")
+            # Still treat snapshot values as usable numbers for the OSD.
+            # Callers check rate_limited/error but multi-account mapping uses
+            # snapshot fields when we strip the hard error below.
+            out.pop("error", None)
+            out["from_usage_snapshot"] = True
+            if result.get("rate_limited"):
+                out["rate_limited"] = True
+            return out
+        return result
 
+    if snap is not None:
+        return dict(snap)
     return {"error": "Invalid account spec"}
 
 
@@ -1028,7 +1229,13 @@ def _account_stats_from_rate_limits(
     rate_limits: dict[str, Any],
 ) -> ClaudeAccountStats:
     """Map a ``fetch_rate_limits`` result onto :class:`ClaudeAccountStats`."""
-    if "error" in rate_limits:
+    # Snapshot fallbacks may carry both numbers and a soft error/rate_limited
+    # flag. Prefer showing the numbers; only hard-fail when there is no usage.
+    has_usage_fields = any(
+        k in rate_limits
+        for k in ("session_utilization", "weekly_utilization", "from_usage_snapshot")
+    )
+    if "error" in rate_limits and not has_usage_fields:
         return ClaudeAccountStats(
             name=name,
             subscription_type=subscription_type,
@@ -1044,6 +1251,7 @@ def _account_stats_from_rate_limits(
         scoped_utilization=float(rate_limits.get("scoped_utilization", 0.0) or 0.0),
         scoped_reset=int(rate_limits.get("scoped_reset", 0) or 0),
         scoped_label=str(rate_limits.get("scoped_label", "") or ""),
+        error=str(rate_limits.get("error") or "") if has_usage_fields and rate_limits.get("error") else "",
     )
 
 

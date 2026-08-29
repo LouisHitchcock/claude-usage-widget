@@ -1492,8 +1492,19 @@ if __name__ == "__main__":
 class TestResolveClaudeAccounts(unittest.TestCase):
     def test_empty_config(self) -> None:
         from claude_usage.collector import _resolve_claude_accounts
-        self.assertEqual(_resolve_claude_accounts({}), [])
-        self.assertEqual(_resolve_claude_accounts({"claude_accounts": []}), [])
+        # Disable store auto-detect so a real ~/.ClaudeCodeMultiAccounts.json
+        # on the developer machine cannot leak into this unit test.
+        self.assertEqual(
+            _resolve_claude_accounts({"claude_accounts_store": False}),
+            [],
+        )
+        self.assertEqual(
+            _resolve_claude_accounts({
+                "claude_accounts": [],
+                "claude_accounts_store": False,
+            }),
+            [],
+        )
 
     def test_bare_names(self) -> None:
         from claude_usage.collector import _resolve_claude_accounts
@@ -1517,6 +1528,77 @@ class TestResolveClaudeAccounts(unittest.TestCase):
             "claude_accounts": [{"name": "work", "credentials": path}],
         })
         self.assertEqual(resolved, [{"name": "work", "credentials": path}])
+
+    def test_entry_nickname_and_map(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        path = os.path.expanduser("~/creds/work.json")
+        resolved = _resolve_claude_accounts({
+            "claude_accounts": [
+                {"name": "personal", "nickname": "Home"},
+                {"name": "work", "credentials": path},
+            ],
+            "claude_account_nicknames": {"work": "Office"},
+        })
+        self.assertEqual(resolved[0]["name"], "Home")
+        self.assertEqual(resolved[1]["name"], "Office")
+        self.assertEqual(resolved[1]["credentials"], path)
+
+    def test_store_labels_prefer_org_and_nicknames(self) -> None:
+        from claude_usage.collector import _resolve_claude_accounts
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store.json")
+            with open(store, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "accounts": [
+                        {
+                            "key": "uuid:a",
+                            "credentials": {"claudeAiOauth": {
+                                "accessToken": "tok-a", "subscriptionType": "pro",
+                            }},
+                            "metadata": {
+                                "displayName": "Louis",
+                                "emailAddress": "louishitchcock@gmail.com",
+                                "organizationName": "louishitchcock@gmail.com's Organization",
+                                "organizationType": "claude_pro",
+                            },
+                            "usageSnapshot": {
+                                "five_hour": {"utilization": 10, "resets_at": "2099-01-01T00:00:00+00:00"},
+                                "seven_day": {"utilization": 20, "resets_at": "2099-01-08T00:00:00+00:00"},
+                            },
+                        },
+                        {
+                            "key": "uuid:b",
+                            "credentials": {"claudeAiOauth": {
+                                "accessToken": "tok-b", "subscriptionType": "team",
+                            }},
+                            "metadata": {
+                                "displayName": "Louis",
+                                "emailAddress": "louis@drone-tech.co.uk",
+                                "organizationName": "DroneTech",
+                                "organizationType": "claude_team",
+                                "seatTier": "team_standard",
+                            },
+                            "usageSnapshot": {
+                                "five_hour": {"utilization": 54, "resets_at": "2099-01-01T00:00:00+00:00"},
+                                "seven_day": {"utilization": 22, "resets_at": "2099-01-08T00:00:00+00:00"},
+                            },
+                        },
+                    ],
+                }, fh)
+            resolved = _resolve_claude_accounts({
+                "claude_accounts_store": store,
+            })
+            self.assertEqual([r["name"] for r in resolved], ["Pro", "DroneTech"])
+
+            nicknamed = _resolve_claude_accounts({
+                "claude_accounts_store": store,
+                "claude_account_nicknames": {
+                    "louishitchcock@gmail.com": "Personal",
+                    "DroneTech": "Work",
+                },
+            })
+            self.assertEqual([r["name"] for r in nicknamed], ["Personal", "Work"])
+            self.assertIn("usage_snapshot", nicknamed[0])
 
     def test_skips_invalid_entries(self) -> None:
         from claude_usage.collector import _resolve_claude_accounts
@@ -1596,3 +1678,70 @@ class TestMultiClaudeCollect(unittest.TestCase):
         # One entry resolves, but collect_all only enables multi mode at 2+.
         resolved = _resolve_claude_accounts({"claude_accounts": ["only"]})
         self.assertEqual(len(resolved), 1)
+
+    def test_store_snapshot_used_when_api_rate_limited(self) -> None:
+        import claude_usage.collector as c
+
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store.json")
+            with open(store, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "accounts": [
+                        {
+                            "key": "a",
+                            "credentials": {"claudeAiOauth": {
+                                "accessToken": "tok-a", "subscriptionType": "pro",
+                                "expiresAt": int((datetime.now(timezone.utc).timestamp() + 3600) * 1000),
+                            }},
+                            "metadata": {
+                                "emailAddress": "a@example.com",
+                                "organizationType": "claude_pro",
+                                "displayName": "Louis",
+                            },
+                            "usageSnapshot": {
+                                "five_hour": {"utilization": 11, "resets_at": "2099-01-01T00:00:00+00:00"},
+                                "seven_day": {"utilization": 22, "resets_at": "2099-01-08T00:00:00+00:00"},
+                            },
+                        },
+                        {
+                            "key": "b",
+                            "credentials": {"claudeAiOauth": {
+                                "accessToken": "tok-b", "subscriptionType": "team",
+                                "expiresAt": int((datetime.now(timezone.utc).timestamp() + 3600) * 1000),
+                            }},
+                            "metadata": {
+                                "emailAddress": "b@example.com",
+                                "organizationName": "DroneTech",
+                                "organizationType": "claude_team",
+                                "displayName": "Louis",
+                            },
+                            "usageSnapshot": {
+                                "five_hour": {"utilization": 54, "resets_at": "2099-01-01T00:00:00+00:00"},
+                                "seven_day": {"utilization": 33, "resets_at": "2099-01-08T00:00:00+00:00"},
+                            },
+                        },
+                    ],
+                }, fh)
+
+            cfg = {
+                "claude_dir": d,
+                "claude_accounts_store": store,
+                "providers": ["claude"],
+                "show_news": False,
+                "burn_alerts_enabled": False,
+                "monthly_budget_usd": 0,
+            }
+            with patch.object(
+                c, "fetch_rate_limits_for_token",
+                lambda *_a, **_k: {"error": "Rate limited -- using last known values", "rate_limited": True},
+            ), patch.object(
+                c, "fetch_rate_limits",
+                lambda *_a, **_k: {"error": "should skip"},
+            ):
+                stats = collect_all(cfg)
+
+            self.assertEqual([a.name for a in stats.claude_accounts], ["Pro", "DroneTech"])
+            self.assertAlmostEqual(stats.claude_accounts[0].session_utilization, 0.11)
+            self.assertAlmostEqual(stats.claude_accounts[1].session_utilization, 0.54)
+            self.assertAlmostEqual(stats.session_utilization, 0.11)
+            self.assertEqual(stats.rate_limit_error, "")

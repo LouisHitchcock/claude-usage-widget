@@ -291,6 +291,33 @@ cc-sync-oauth   # re-snapshot the live login after a fresh /login
 
 Aliases: `ccs` = `cc-switch`, `ccso` = `cc-sync-oauth`.
 
+### Nicknames / rename accounts
+
+Default labels prefer org/plan over profile names (so two accounts both named "Louis" become **Pro** and **DroneTech** instead of Louis / Louis-2). Override any label with nicknames:
+
+```json
+{
+    "claude_account_nicknames": {
+        "louishitchcock@gmail.com": "Personal",
+        "DroneTech": "Work",
+        "pro": "Home"
+    }
+}
+```
+
+Keys match email, organization name, subscription type (`pro` / `team`), store key, or the current default label (case-insensitive).
+
+For path-based lists you can also set a per-entry nickname:
+
+```json
+{
+    "claude_accounts": [
+        {"name": "personal", "nickname": "Home"},
+        {"name": "work", "credentials": "~/path/to/work.credentials.json", "nickname": "Work"}
+    ]
+}
+```
+
 ### Manual credential paths (alternative)
 
 ```json
@@ -304,7 +331,7 @@ Aliases: `ccs` = `cc-switch`, `ccso` = `cc-sync-oauth`.
 
 Bare names resolve under `$claude_dir/accounts/<name>.credentials.json`. Path-based lists override store auto-detect. Set `"claude_accounts_store": false` to disable auto-detect even when the store file exists.
 
-When 2+ accounts resolve, the OSD draws labeled **5h / 7d** rows (and scoped caps) per account in bars view, gauge view, and every theme/skin. The first successful account still fills primary session/weekly fields for the popup, forecasts, and sparkline. Single-account setups are unchanged: leave `claude_accounts` empty and skip the multi-account store.
+When 2+ accounts resolve, the OSD draws labeled **5h / 7d** rows (and scoped caps) per account in bars view, gauge view, and every theme/skin. The first successful account still fills primary session/weekly fields for the popup, forecasts, and sparkline. If `/api/oauth/usage` is rate-limited, the widget falls back to each account's `usageSnapshot` from the multi-account store instead of showing 0%. Single-account setups are unchanged: leave `claude_accounts` empty and skip the multi-account store.
 
 ## Configuration
 
@@ -336,8 +363,9 @@ cp config.json.example config.json
 | `osd_opacity` | `0.75` | OSD background opacity (0.15--1.0) |
 | `providers` | `["claude"]` | Add `"codex"` to also poll the local OpenAI Codex CLI (`codex app-server`) and show its 5h/weekly usage beneath Claude's — an extra ring row in gauge view, two extra bars in bars view. POSIX-only. |
 | `codex_poll_seconds` | `300` | How often (seconds) to spawn the codex app-server RPC; an on-disk cache is served in between. |
-| `claude_accounts` | `[]` | Optional multi-Claude path list. When 2+ entries are set, labeled 5h/7d rows per account. Bare name or `{"name", "credentials"}`. Empty = auto-use `~/.ClaudeCodeMultiAccounts.json` if present. |
+| `claude_accounts` | `[]` | Optional multi-Claude path list. When 2+ entries are set, labeled 5h/7d rows per account. Bare name or `{"name", "credentials", "nickname"}`. Empty = auto-use `~/.ClaudeCodeMultiAccounts.json` if present. |
 | `claude_accounts_store` | `null` | Path to a ClaudeCodeMultiAccounts store, or `false`/`""` to disable auto-detect. `null` = `~/.ClaudeCodeMultiAccounts.json` when that file exists and `claude_accounts` is empty. |
+| `claude_account_nicknames` | `{}` | Map of email / org / plan / label → short OSD nickname for auto-detected store accounts (and path-based rows). |
 | `daily_message_limit` | `200` | Daily message limit for local tracking in the popup |
 | `weekly_message_limit` | `1000` | Weekly message limit for local tracking in the popup |
 | `daily_token_limit` | `5000000` | Daily token limit for local tracking |
