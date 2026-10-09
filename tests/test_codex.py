@@ -149,9 +149,9 @@ def test_rpc_round_trip_with_fake_process():
         def __init__(self):
             self.stdin = Input()
             self.stdout = io.BytesIO(
-                (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\\n"
+                (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n"
                  + json.dumps({"jsonrpc": "2.0", "id": 2, "result": _payload(
-                     primary={"usedPercent": 40, "resetsAt": FUTURE})}) + "\\n").encode()
+                     primary={"usedPercent": 40, "resetsAt": FUTURE})}) + "\n").encode()
             )
         def kill(self):
             pass
