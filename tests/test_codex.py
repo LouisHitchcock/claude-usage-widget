@@ -206,3 +206,18 @@ def test_rpc_times_out_on_partial_line():
         elapsed = clock.monotonic() - begin
     assert result is None
     assert elapsed < 0.8
+
+
+def test_find_codex_windows_installer_when_missing_from_path():
+    """Explorer-launched widget should discover a native per-user install."""
+    from pathlib import Path
+
+    with patch.object(codex.os, "name", "nt"), \
+         patch.object(codex.shutil, "which", return_value=None), \
+         patch.dict(codex.os.environ, {"LOCALAPPDATA": r"C:\\Users\\Test\\AppData\\Local"}), \
+         patch.object(codex.os.path, "isfile", side_effect=lambda p:
+                      Path(p).name == "codex.exe"):
+        found = codex.find_codex_bin()
+    assert found is not None
+    assert found.endswith("codex.exe")
+    assert "OpenAI" in found
