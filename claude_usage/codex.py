@@ -13,16 +13,16 @@ every ``poll_seconds``. Between polls — and on RPC failure — the cache is
 served, with expired windows clamped back to zero exactly like the Claude
 sample-fallback path in ``collector.collect_all``.
 
-POSIX-only for now: the reader uses ``select`` on pipes, which does not
-work on Windows. On other platforms ``collect_codex`` reports
-unavailable and the UI simply never shows the Codex rows.
+Uses a background pipe reader and a bounded queue wait, which work on Windows,
+Linux and macOS. A stalled or partial response cannot block widget refresh.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import select
+import queue
+import threading
 import shutil
 import subprocess
 import time
@@ -47,16 +47,11 @@ def find_codex_bin() -> str | None:
 
 
 def _rate_limits_rpc(codex_bin: str, timeout: float = RPC_TIMEOUT_SECONDS) -> dict[str, Any] | None:
-    """Run one ``account/rateLimits/read`` round-trip against ``codex app-server``.
+    """Query Codex with a single bounded deadline on every platform.
 
-    The read side is hard-bounded by a wall-clock deadline using ``select`` +
-    raw ``os.read`` rather than ``readline``: ``select`` readiness only
-    guarantees at least one byte, so a blocking ``readline`` on a partial line
-    with no trailing newline could block past the deadline and hang the refresh
-    thread — which, via the widget's single-flight ``_refreshing`` latch, would
-    freeze *every* subsequent refresh. Accumulating bytes and splitting on
-    newlines ourselves keeps the whole call bounded at ``timeout`` seconds no
-    matter how the app-server behaves.
+    A daemon reader consumes newline-delimited stdout in the background.
+    Waiting on a queue (rather than select() on a pipe) works on Windows;
+    killing the subprocess on timeout also unblocks a partial readline().
     """
     proc = subprocess.Popen(
         [codex_bin, "app-server"],
@@ -67,14 +62,26 @@ def _rate_limits_rpc(codex_bin: str, timeout: float = RPC_TIMEOUT_SECONDS) -> di
 
     def send(obj: dict[str, Any]) -> None:
         assert proc.stdin is not None
-        proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        proc.stdin.write((json.dumps(obj) + "\\n").encode("utf-8"))
         proc.stdin.flush()
 
+    messages: queue.Queue[bytes | None] = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                messages.put(line)
+        except OSError:
+            pass
+        finally:
+            messages.put(None)
+
+    reader = threading.Thread(target=read_lines, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
     result: dict[str, Any] | None = None
-    buf = b""
     try:
-        assert proc.stdout is not None
-        fd = proc.stdout.fileno()
         send({
             "jsonrpc": "2.0",
             "id": 1,
@@ -85,43 +92,47 @@ def _rate_limits_rpc(codex_bin: str, timeout: float = RPC_TIMEOUT_SECONDS) -> di
                 "version": "0",
             }},
         })
-        deadline = time.monotonic() + timeout
-        while result is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        initialized = False
+        while time.monotonic() < deadline:
+            try:
+                raw = messages.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
                 break
-            ready, _, _ = select.select([fd], [], [], remaining)
-            if not ready:
+            if raw is None:
                 break
-            chunk = os.read(fd, 65536)
-            if not chunk:  # EOF — app-server exited
+            try:
+                msg = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, AttributeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("id") == 1 and not initialized:
+                initialized = True
+                send({"jsonrpc": "2.0", "method": "initialized"})
+                # Allow the app-server's handshake to settle, without
+                # extending the overall RPC deadline.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.6, remaining))
+                if time.monotonic() >= deadline:
+                    break
+                send({
+                    "jsonrpc": "2.0", "id": 2,
+                    "method": "account/rateLimits/read", "params": {},
+                })
+            elif msg.get("id") == 2 and initialized:
+                value = msg.get("result")
+                result = value if isinstance(value, dict) else None
                 break
-            buf += chunk
-            while b"\n" in buf and result is None:
-                raw, buf = buf.split(b"\n", 1)
-                if not raw.strip():
-                    continue
-                try:
-                    msg = json.loads(raw.decode("utf-8", "replace"))
-                except ValueError:
-                    continue
-                if msg.get("id") == 1:
-                    send({"jsonrpc": "2.0", "method": "initialized"})
-                    # The app-server needs a beat between the handshake and the
-                    # first real request or it drops it on the floor.
-                    time.sleep(0.6)
-                    send({"jsonrpc": "2.0", "id": 2,
-                          "method": "account/rateLimits/read", "params": {}})
-                elif msg.get("id") == 2:
-                    result = msg.get("result")
     finally:
         try:
             proc.kill()
         except OSError:
             pass
         try:
-            proc.wait(timeout=1)  # reap so we don't leave a zombie
-        except Exception:
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
             pass
         for pipe in (proc.stdin, proc.stdout):
             try:
@@ -129,8 +140,8 @@ def _rate_limits_rpc(codex_bin: str, timeout: float = RPC_TIMEOUT_SECONDS) -> di
                     pipe.close()
             except OSError:
                 pass
+        reader.join(timeout=0.2)
     return result
-
 
 def parse_rate_limits(payload: Any) -> dict[str, Any] | None:
     """Extract the two utilization windows from a rateLimits/read result.
@@ -214,8 +225,6 @@ def collect_codex(poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict[str, Any]:
         "session_pct": 0.0, "session_reset": 0,
         "weekly_pct": 0.0, "weekly_reset": 0,
     }
-    if os.name != "posix":
-        return {**unavailable, "error": "codex provider is POSIX-only for now"}
     codex_bin = find_codex_bin()
     if codex_bin is None:
         return {**unavailable, "error": "codex binary not found"}
