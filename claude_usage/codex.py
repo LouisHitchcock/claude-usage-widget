@@ -32,6 +32,7 @@ from typing import Any
 RPC_TIMEOUT_SECONDS = 12
 DEFAULT_POLL_SECONDS = 300
 CACHE_PATH = Path.home() / ".cache" / "claude-usage" / "codex_limits.json"
+STATUS_PATH = CACHE_PATH.with_name("codex_status.json")
 _BIN_CANDIDATES = ("/opt/homebrew/bin/codex", "/usr/local/bin/codex")
 
 
@@ -181,15 +182,41 @@ def parse_rate_limits(payload: Any) -> dict[str, Any] | None:
             reset_ts //= 1000
         return pct, reset_ts
 
-    primary = window(limits.get("primary"))
-    secondary = window(limits.get("secondary"))
-    if primary is None and secondary is None:
+    # Window position is not a duration: weekly-only plans may put their
+    # 10080-minute window in "primary" and leave "secondary" null.
+    session = None
+    weekly = None
+    unknown = []
+    for key in ("primary", "secondary"):
+        block = limits.get(key)
+        parsed = window(block)
+        if parsed is None:
+            continue
+        duration = block.get("windowDurationMins")
+        try:
+            duration = int(duration)
+        except (ValueError, TypeError):
+            duration = None
+        if duration == 300:
+            session = parsed
+        elif duration == 10080:
+            weekly = parsed
+        else:
+            unknown.append(parsed)
+
+    # Older app-server versions may omit durations; preserve their ordering.
+    if unknown:
+        if session is None:
+            session = unknown.pop(0)
+        if weekly is None and unknown:
+            weekly = unknown.pop(0)
+    if session is None and weekly is None:
         return None
     return {
-        "session_pct": primary[0] if primary else 0.0,
-        "session_reset": primary[1] if primary else 0,
-        "weekly_pct": secondary[0] if secondary else 0.0,
-        "weekly_reset": secondary[1] if secondary else 0,
+        "session_pct": session[0] if session else 0.0,
+        "session_reset": session[1] if session else 0,
+        "weekly_pct": weekly[0] if weekly else 0.0,
+        "weekly_reset": weekly[1] if weekly else 0,
     }
 
 
@@ -223,6 +250,22 @@ def _clamp_expired(parsed: dict[str, Any], now_ts: float) -> dict[str, Any]:
     return out
 
 
+def _report_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Write safe troubleshooting metadata, never tokens or raw RPC payloads."""
+    try:
+        STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_PATH.write_text(json.dumps({
+            "checked_at": time.time(),
+            "available": status.get("available", False),
+            "error": status.get("error", ""),
+            "session_pct": status.get("session_pct", 0),
+            "weekly_pct": status.get("weekly_pct", 0),
+        }, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return status
+
+
 def collect_codex(poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict[str, Any]:
     """Return Codex utilization for the overlay; never raises.
 
@@ -236,7 +279,7 @@ def collect_codex(poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict[str, Any]:
     }
     codex_bin = find_codex_bin()
     if codex_bin is None:
-        return {**unavailable, "error": "codex binary not found"}
+        return _report_status({**unavailable, "error": "codex binary not found"})
 
     now_ts = time.time()
     cache = _load_cache()
@@ -244,13 +287,13 @@ def collect_codex(poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict[str, Any]:
         age = now_ts - float(cache.get("fetched_at", 0) or 0)
         parsed = parse_rate_limits(cache.get("payload"))
         if parsed is not None and 0 <= age < poll_seconds:
-            return {"available": True, "error": "", **_clamp_expired(parsed, now_ts)}
+            return _report_status({"available": True, "error": "", **_clamp_expired(parsed, now_ts)})
 
     payload = None
     try:
         payload = _rate_limits_rpc(codex_bin)
-    except OSError:
-        payload = None
+    except (OSError, ValueError, RuntimeError) as exc:
+        return _report_status({**unavailable, "error": f"app-server failed: {type(exc).__name__}: {exc}"})
     parsed = parse_rate_limits(payload)
     if parsed is not None:
         assert isinstance(payload, dict)
@@ -261,6 +304,6 @@ def collect_codex(poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict[str, Any]:
     if cache is not None:
         parsed = parse_rate_limits(cache.get("payload"))
         if parsed is not None:
-            return {"available": True, "error": "rpc failed; serving cache",
-                    **_clamp_expired(parsed, now_ts)}
-    return {**unavailable, "error": "rateLimits/read returned no window data"}
+            return _report_status({"available": True, "error": "rpc failed; serving cache",
+                    **_clamp_expired(parsed, now_ts)})
+    return _report_status({**unavailable, "error": "rateLimits/read returned no window data"})
