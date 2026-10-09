@@ -1,0 +1,48 @@
+name: Windows portable executable
+
+on:
+  push:
+    branches:
+      - fix/codex-windows-support-20261009
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package, tests and PyInstaller
+        run: python -m pip install -e . pytest pyinstaller
+      - name: Run test suite on Windows
+        run: python -m pytest -q
+      - name: Build portable EXE
+        run: >
+          python -m PyInstaller
+          --noconfirm --clean --onefile --windowed
+          --name ClaudeUsageWidget
+          --collect-data claude_usage
+          --hidden-import PySide6.QtSvg
+          scripts/windows_launcher.py
+      - name: Validate executable exists
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/ClaudeUsageWidget.exe")) { throw "Executable not produced" }
+          Get-Item "dist/ClaudeUsageWidget.exe" | Select-Object Name,Length
+      - name: Upload portable executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeUsageWidget-Windows-x64
+          path: dist/ClaudeUsageWidget.exe
+          if-no-files-found: error
+          retention-days: 30
