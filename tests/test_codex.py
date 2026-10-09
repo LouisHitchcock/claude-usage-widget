@@ -68,11 +68,16 @@ def test_clamp_expired_windows_roll_back_to_zero():
 
 # --- collect_codex cache / throttle / fallback path -----------------------
 
-def test_collect_codex_non_posix_is_unavailable():
-    with patch.object(codex.os, "name", "nt"):
+def test_collect_codex_windows_can_collect():
+    payload = _payload(primary={"usedPercent": 47, "resetsAt": FUTURE})
+    with patch.object(codex.os, "name", "nt"), \
+         patch.object(codex, "find_codex_bin", return_value="codex.exe"), \
+         patch.object(codex, "_load_cache", return_value=None), \
+         patch.object(codex, "_rate_limits_rpc", return_value=payload), \
+         patch.object(codex, "_save_cache"):
         out = codex.collect_codex()
-    assert out["available"] is False
-    assert "POSIX" in out["error"]
+    assert out["available"] is True
+    assert out["session_pct"] == 0.47
 
 
 def test_collect_codex_missing_binary_is_unavailable():
@@ -130,3 +135,74 @@ def test_collect_codex_rpc_failure_falls_back_to_stale_cache():
     assert out["available"] is True
     assert "rpc failed" in out["error"]
     assert abs(out["session_pct"] - 0.42) < 1e-6
+
+def test_rpc_round_trip_with_fake_process():
+    """JSON-RPC init, notifications and limit request work without select()."""
+    import io
+    import json
+
+    class Input(io.BytesIO):
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = Input()
+            self.stdout = io.BytesIO(
+                (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\\n"
+                 + json.dumps({"jsonrpc": "2.0", "id": 2, "result": _payload(
+                     primary={"usedPercent": 40, "resetsAt": FUTURE})}) + "\\n").encode()
+            )
+        def kill(self):
+            pass
+        def wait(self, timeout=None):
+            return 0
+
+    proc = FakeProcess()
+    with patch.object(codex.subprocess, "Popen", return_value=proc), \
+         patch.object(codex.time, "sleep"):
+        result = codex._rate_limits_rpc("codex", timeout=2)
+    assert result == _payload(primary={"usedPercent": 40, "resetsAt": FUTURE})
+    sent = [json.loads(line) for line in proc.stdin.getvalue().splitlines()]
+    assert [message["method"] for message in sent] == [
+        "initialize", "initialized", "account/rateLimits/read",
+    ]
+
+
+def test_rpc_times_out_on_partial_line():
+    """A blocked pipe reader cannot block the caller indefinitely."""
+    import threading
+    import time as clock
+
+    release = threading.Event()
+
+    class BlockingOutput:
+        def __iter__(self):
+            release.wait(1)
+            return iter(())
+        def close(self):
+            release.set()
+
+    class Input:
+        def write(self, data):
+            return len(data)
+        def flush(self):
+            pass
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = Input()
+            self.stdout = BlockingOutput()
+        def kill(self):
+            release.set()
+        def wait(self, timeout=None):
+            return 0
+
+    with patch.object(codex.subprocess, "Popen", return_value=FakeProcess()):
+        begin = clock.monotonic()
+        result = codex._rate_limits_rpc("codex", timeout=0.05)
+        elapsed = clock.monotonic() - begin
+    assert result is None
+    assert elapsed < 0.8
