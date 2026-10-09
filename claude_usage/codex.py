@@ -62,7 +62,7 @@ def _rate_limits_rpc(codex_bin: str, timeout: float = RPC_TIMEOUT_SECONDS) -> di
 
     def send(obj: dict[str, Any]) -> None:
         assert proc.stdin is not None
-        proc.stdin.write((json.dumps(obj) + "\\n").encode("utf-8"))
+        proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
         proc.stdin.flush()
 
     messages: queue.Queue[bytes | None] = queue.Queue()
