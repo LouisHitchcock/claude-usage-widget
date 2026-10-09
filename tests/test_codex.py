@@ -221,3 +221,23 @@ def test_find_codex_windows_installer_when_missing_from_path():
     assert found is not None
     assert found.endswith("codex.exe")
     assert "OpenAI" in found
+
+
+def test_weekly_only_primary_window_is_not_mislabeled_session():
+    parsed = parse_rate_limits(_payload(
+        primary={"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": FUTURE},
+    ))
+    assert parsed is not None
+    assert parsed["session_pct"] == 0.0
+    assert parsed["weekly_pct"] == 0.61
+    assert parsed["weekly_reset"] == FUTURE
+
+
+def test_reversed_duration_windows_are_classified_correctly():
+    parsed = parse_rate_limits(_payload(
+        primary={"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": FUTURE},
+        secondary={"usedPercent": 10, "windowDurationMins": 300, "resetsAt": FUTURE},
+    ))
+    assert parsed is not None
+    assert parsed["session_pct"] == 0.10
+    assert parsed["weekly_pct"] == 0.40
