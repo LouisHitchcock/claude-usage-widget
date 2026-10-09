@@ -40,8 +40,17 @@ def find_codex_bin() -> str | None:
     which = shutil.which("codex")
     if which:
         return which
+    # Explorer-launched GUI apps can inherit a different PATH from terminal
+    # sessions. Check the native Windows Codex installer location explicitly.
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local_app_data:
+        candidate = os.path.join(
+            local_app_data, "Programs", "OpenAI", "Codex", "bin", "codex.exe"
+        )
+        if os.path.isfile(candidate):
+            return candidate
     for candidate in _BIN_CANDIDATES:
-        if os.path.exists(candidate):
+        if os.path.isfile(candidate):
             return candidate
     return None
 
